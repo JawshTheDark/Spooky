@@ -91,8 +91,21 @@ data class Buffer(
     val isSystem: Boolean get() = networkId == null
     val isServerBuffer: Boolean get() = target.startsWith(":server:")
 
+    /** A `=nick` DCC CHAT (the irssi convention). A buffer NAME, never an IRC
+     *  target: the server routes anything sent here over the direct socket. */
+    val isDccChat: Boolean get() = Commands.isDccChat(target)
+
+    /** Who a DM or DCC chat is with — the peer's nick, without the `=`. */
+    val peer: String get() = Commands.dccPeer(target)
+
     /** What the UI calls this buffer; raw pseudo-targets get friendly names. */
     val displayName: String get() = if (isServerBuffer) "Server" else target
+}
+
+/** A peer's inbound DCC CHAT offer awaiting our answer. Nothing is dialled until
+ *  it's accepted; the server expires it after ten minutes. */
+data class DccChatOffer(val networkId: Int, val nick: String, val passive: Boolean) {
+    val key: String get() = "$networkId::${nick.lowercase()}"
 }
 
 /** A rendered line. System events (join/part/…) carry [system] = true. */

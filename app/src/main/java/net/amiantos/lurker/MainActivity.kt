@@ -218,6 +218,8 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.key
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -604,20 +606,25 @@ class MainActivity : FragmentActivity() {
                         onOpenMultichan = { go(Screen.Multichan) },
                         onSignOut = { LurkerConnectionService.stop(this@MainActivity); client.signOut() },
                     )
-                    is Screen.Chat -> ChatScreen(
-                        client = client,
-                        buffer = s.buffer,
-                        scrollToMsgId = s.scrollToMsgId,
-                        sharedUri = sharedUri,
-                        onShareConsumed = { sharedUri = null },
-                        onBack = { back() },
-                        onOpenBuffer = { buffer ->
-                            client.setActive(buffer)
-                            go(Screen.Chat(buffer))
-                        },
-                        onBrowse = { q -> go(Screen.ChannelList(q)) },
-                        onSettings = { client.loadSettings(); go(Screen.Settings) },
-                    )
+                    // Keyed per buffer: Chat -> Chat (a /query, a DCC accept, a
+                    // notification) otherwise REUSES the composable, carrying the old
+                    // buffer's scroll state and measured bar heights into the new one.
+                    is Screen.Chat -> key(s.buffer.key) {
+                        ChatScreen(
+                            client = client,
+                            buffer = s.buffer,
+                            scrollToMsgId = s.scrollToMsgId,
+                            sharedUri = sharedUri,
+                            onShareConsumed = { sharedUri = null },
+                            onBack = { back() },
+                            onOpenBuffer = { buffer ->
+                                client.setActive(buffer)
+                                go(Screen.Chat(buffer))
+                            },
+                            onBrowse = { q -> go(Screen.ChannelList(q)) },
+                            onSettings = { client.loadSettings(); go(Screen.Settings) },
+                        )
+                    }
                     Screen.Settings -> SettingsScreen(client, prefs) { back() }
                     Screen.Dcc -> DccScreen(
                         client = client,
@@ -925,7 +932,7 @@ private fun TabletHome(
         }
         // Middle — the selected conversation.
         Box(Modifier.weight(1f).fillMaxHeight()) {
-            if (selectedBuffer != null) {
+            if (selectedBuffer != null) key(selectedBuffer.key) {
                 ChatScreen(
                     client = client,
                     buffer = selectedBuffer,
@@ -1653,6 +1660,9 @@ private fun BufferListBody(
                     )
                 }
             }
+            if (client.serverFeatures && client.dccChatOffers.isNotEmpty()) {
+                item { DccChatBanner(client, current = null) }
+            }
             // The Multi-channel firehose: a single pinned entry above every network
             // that merges the timelines of all toggled channels. Shown only once at
             // least one channel opts in (from its control panel).
@@ -1734,9 +1744,13 @@ private fun BufferListBody(
                                 e2e = e2eFlag,
                                 // "" (not null) when unknown: the row still shows a
                                 // dot, greyed, rather than dropping it entirely.
-                                presence = if (isFriendRow) {
-                                    client.presenceState(buffer.networkId, buffer.target).orEmpty()
-                                } else null,
+                                presence = when {
+                                    // A DCC peer has no IRC presence — the socket is the
+                                    // whole story: green while the chat is live.
+                                    buffer.isDccChat -> if (client.isDccChatLive(buffer)) "online" else ""
+                                    isFriendRow -> client.presenceState(buffer.networkId, buffer.target).orEmpty()
+                                    else -> null
+                                },
                                 // Favorites carry no display name (2.0 dropped the
                                 // named-contact model) — the row reads the nick.
                                 label = null,
@@ -1747,7 +1761,7 @@ private fun BufferListBody(
                                 // Server refuses system/server pseudo-buffers, so
                                 // don't offer it there.
                                 favorite = client.isFavorite(buffer),
-                                onToggleFavorite = if (buffer.isSystem || buffer.isServerBuffer) null else {
+                                onToggleFavorite = if (buffer.isSystem || buffer.isServerBuffer || buffer.isDccChat) null else {
                                     { client.toggleFavorite(buffer.networkId, buffer.target) }
                                 },
                                 onToggleNotify = if (buffer.isChannel) {
@@ -2343,6 +2357,10 @@ private fun ChatScreen(
         )
     }
     val oldestId = messages.firstOrNull { it.id > 0 }?.id
+    // Measured heights of the frosted top bar and composer overlays (the list's
+    // content padding). Declared up here so the tail-pin effects can key on them.
+    var topBarHeightPx by remember { mutableStateOf(0) }
+    var bottomBarHeightPx by remember { mutableStateOf(0) }
     // Set when a load-older is requested: the id whose row we re-anchor to once
     // the prepend lands, so the viewport doesn't jump.
     var anchorId by remember(buffer.key) { mutableStateOf<Long?>(null) }
@@ -2380,6 +2398,19 @@ private fun ChatScreen(
         awaySinceId?.let { since -> messages.count { it.id > since && !it.system && !it.self } } ?: 0
     }
 
+    // Whether the reader is parked on the newest row. Tracked from scroll gestures
+    // (and set by our own tail scrolls) rather than derived from layout, because a
+    // PADDING change — the composer measuring in after the first frame, the
+    // keyboard sliding up — pushes the tail under the composer without any scroll
+    // happening. By the time layout reflects that, "at bottom" already reads false
+    // (or, with the atBottom slack, falsely true), so nothing re-pinned and a
+    // channel opened with the keyboard up landed several messages short.
+    var pinnedToTail by remember(buffer.key) { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) pinnedToTail = !listState.canScrollForward
+        }
+    }
     // Opening a buffer lands at the newest message ONCE (regardless of scroll
     // position), the moment its rows populate. After that, live messages only
     // follow the tail if you're already at the bottom — so you never fight it.
@@ -2404,6 +2435,7 @@ private fun ChatScreen(
             targetIdx >= 0 -> {
                 listState.scrollToItem(targetIdx + headerCount)
                 openScrollDone = true
+                pinnedToTail = false
                 scrolledToTarget = true
                 flashMsgId = scrollToMsgId
             }
@@ -2411,6 +2443,7 @@ private fun ChatScreen(
             !openScrollDone -> {
                 listState.scrollToItem(rows.lastIndex + headerCount)
                 openScrollDone = true
+                pinnedToTail = true
             }
         }
     }
@@ -2427,6 +2460,7 @@ private fun ChatScreen(
     // the line being sent — that's fine and self-correcting: it lands us inside the
     // atBottom slack, so the tail-follow below catches the new row when it arrives.
     fun repinToTail() {
+        pinnedToTail = true
         chatScope.launch {
             listState.scrollToItem((rows.lastIndex + headerCount).coerceAtLeast(0))
         }
@@ -2463,6 +2497,18 @@ private fun ChatScreen(
             }
             // Local command output (/help and friends) is id-less too.
             is ParsedInput.Local -> { client.localNotice(buffer, parsed.message); repinToTail() }
+            is ParsedInput.DccChat -> {
+                val networkId = buffer.networkId
+                if (!client.serverFeatures || networkId == null) {
+                    client.localNotice(buffer, "DCC chat needs a Lurker server.")
+                } else {
+                    client.dccChat(
+                        networkId, parsed.nick, open = !parsed.close, passive = parsed.passive,
+                        reportTo = buffer, focus = !parsed.close,
+                    )
+                }
+                repinToTail()
+            }
             is ParsedInput.Browse ->
                 // Lurker has a rich channel browser; direct mode falls back
                 // to a raw LIST (results land in the server buffer).
@@ -2500,6 +2546,15 @@ private fun ChatScreen(
         // next append, which on a busy channel repeats and traps them at the bottom.
         if (openScrollDone && anchorId == null && atBottom && !listState.isScrollInProgress) {
             listState.scrollToItem(rows.lastIndex + headerCount)
+        }
+    }
+    // The composer (and the keyboard under it) or the top bar changed height: a
+    // reader parked on the tail stays on it. Runs on every frame of the IME
+    // animation, which is what keeps the newest line glued above the keyboard.
+    LaunchedEffect(bottomBarHeightPx, topBarHeightPx) {
+        if (rows.isEmpty() || !openScrollDone || anchorId != null) return@LaunchedEffect
+        if (pinnedToTail && !listState.isScrollInProgress) {
+            listState.scrollToItem(maxOf(0, listState.layoutInfo.totalItemsCount - 1, rows.lastIndex + headerCount))
         }
     }
     // An image resizing its card mustn't shove the tail out from under a reader
@@ -2548,8 +2603,6 @@ private fun ChatScreen(
     // whatever passes beneath them.
     val hazeState = remember { HazeState() }
     val density = LocalDensity.current
-    var topBarHeightPx by remember { mutableStateOf(0) }
-    var bottomBarHeightPx by remember { mutableStateOf(0) }
 
     Box(Modifier.fillMaxSize().background(CanvasBlack)) {
         // A custom chat background image (device-local) replaces the ambient wash
@@ -2735,14 +2788,30 @@ private fun ChatScreen(
                                 text = { Text("Translate", color = AccentBlue) },
                                 onClick = { titleMenu = false; showTranslate = true },
                             )
-                            DropdownMenuItem(
+                            // E2E rides IRC; a DCC chat is already a direct socket.
+                            if (!buffer.isDccChat) DropdownMenuItem(
                                 text = { Text("Encryption (E2E)", color = OnlineGreen) },
                                 onClick = { titleMenu = false; showE2e = true; client.execute(buffer, listOf(WireOp("e2e", target = buffer.target, line = "status"))) },
                             )
+                            val dccNet = buffer.networkId
+                            if (buffer.isDccChat && dccNet != null && client.serverFeatures) {
+                                val live = client.isDccChatLive(buffer)
+                                DropdownMenuItem(
+                                    text = { Text(if (live) "End DCC chat" else "Start DCC chat again", color = AccentBlue) },
+                                    onClick = {
+                                        titleMenu = false
+                                        client.dccChat(dccNet, buffer.peer, open = !live, reportTo = buffer)
+                                    },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = {
                                     Text(
-                                        if (buffer.isChannel) "Close (leaves ${buffer.target})" else "Close conversation",
+                                        when {
+                                            buffer.isChannel -> "Close (leaves ${buffer.target})"
+                                            buffer.isDccChat -> "Close (ends the chat)"
+                                            else -> "Close conversation"
+                                        },
                                         color = AlertRed,
                                     )
                                 },
@@ -2774,6 +2843,9 @@ private fun ChatScreen(
                     }
                 },
             )
+            // Pending DCC chat offers, and this `=nick` chat's own connection state.
+            // Inside the measured top column so the list's padding follows it.
+            if (client.serverFeatures) DccChatBanner(client, current = buffer)
         }
 
         // Channel control panel — tap the channel name pill to slide it out.
@@ -2969,6 +3041,7 @@ private fun ChatScreen(
                         .background(SurfaceRaised, CircleShape)
                         .border(0.5.dp, GlassBorder, CircleShape)
                         .clickable {
+                            pinnedToTail = true
                             scope.launch {
                                 listState.scrollToItem(maxOf(0, listState.layoutInfo.totalItemsCount - 1))
                             }
@@ -3380,12 +3453,16 @@ private fun MemberActions(
         SheetAction("Ignore (everything)", danger = true) {
             client.addIgnore(networkId, member.banMask, levels = listOf("ALL")); onDone()
         }
-        // FORK-ONLY (outgoing DCC): only when the server supports it.
+        // FORK-ONLY (outgoing DCC SEND): only when the server supports it.
         if (client.serverExtended) {
             SheetAction("DCC: send a file…") { onPickFileFor(nick) }
+        }
+        // DCC CHAT is upstream Lurker (/api/dcc/chat); the server answers 403 with
+        // a clear reason when it isn't enabled for the account.
+        if (client.serverFeatures) {
             SheetAction("DCC: start a chat") {
-                client.dccChat(networkId, nick, open = true)
-                onOpenBuffer(client.focusTarget(networkId, "=$nick"))
+                client.dccChat(networkId, nick, open = true, focus = true)
+                onDone()
             }
         }
         if (canModerate) {
@@ -7019,12 +7096,78 @@ private fun DccScreen(client: LurkerClient, onOpenBuffer: (Buffer) -> Unit, onBa
                 item { Text(err, color = AlertRed, modifier = Modifier.padding(16.dp)) }
             }
             // FORK-ONLY (outgoing DCC): receiving transfers still list below.
-            if (client.serverExtended) item { DccStartCard(client, onOpenBuffer) }
+            item { DccStartCard(client, onOpenBuffer) }
             if (transfers.isEmpty()) {
                 item { Text("No transfers.", Modifier.padding(16.dp), color = TextSecondary) }
             }
             items(transfers.size) { i -> TransferRow(client, transfers[i]) }
             item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+/**
+ * DCC CHAT prompts. Every pending inbound offer gets Accept / Decline — nothing is
+ * dialled until the user says so (the server never auto-accepts). In a `=nick`
+ * chat ([current]) whose session isn't live and has no offer pending, a strip says
+ * so and offers to start it again, the way a DM says its peer is offline.
+ */
+@Composable
+private fun DccChatBanner(client: LurkerClient, current: Buffer?) {
+    val offers = client.dccChatOffers.values.sortedBy { it.nick.lowercase() }
+    val currentNet = current?.networkId
+    val showDown = current != null && current.isDccChat && currentNet != null &&
+        !client.isDccChatLive(current) && client.dccOfferFor(current) == null
+    if (offers.isEmpty() && !showDown) return
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        offers.forEach { offer ->
+            DccStrip(
+                text = "${offer.nick} wants to start a DCC chat" +
+                    (if (client.networks.size > 1) " (${client.networkName(offer.networkId)})" else "") +
+                    (if (offer.passive) " — they're firewalled, so the server will listen" else ""),
+                primary = "Accept",
+                onPrimary = {
+                    client.dccChat(offer.networkId, offer.nick, open = true, reportTo = current, focus = true)
+                },
+                secondary = "Decline",
+                onSecondary = { client.dccChat(offer.networkId, offer.nick, open = false, reportTo = current) },
+            )
+        }
+        if (showDown && current != null && currentNet != null) {
+            DccStrip(
+                text = "DCC chat with ${current.peer} is not connected.",
+                primary = "Start again",
+                onPrimary = { client.dccChat(currentNet, current.peer, open = true, reportTo = current) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun DccStrip(
+    text: String,
+    primary: String,
+    onPrimary: () -> Unit,
+    secondary: String? = null,
+    onSecondary: () -> Unit = {},
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(SurfaceRaised, RoundedCornerShape(10.dp))
+            .border(0.5.dp, GlassBorder, RoundedCornerShape(10.dp))
+            .padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+    ) {
+        Text(text, color = TextPrimary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        if (secondary != null) {
+            TextButton(onClick = onSecondary) { Text(secondary, color = TextSecondary, fontSize = 13.sp) }
+        }
+        TextButton(onClick = onPrimary) {
+            Text(primary, color = AccentBlue, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -7059,7 +7202,11 @@ private fun DccStartCard(client: LurkerClient, onOpenBuffer: (Buffer) -> Unit) {
         modifier = Modifier.fillMaxWidth().padding(16.dp, 8.dp),
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Start a transfer or chat", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            Text(
+                if (client.serverExtended) "Start a transfer or chat" else "Start a DCC chat",
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 15.sp,
+            )
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box {
                     TextButton(onClick = { netMenu = true }) {
@@ -7094,16 +7241,15 @@ private fun DccStartCard(client: LurkerClient, onOpenBuffer: (Buffer) -> Unit) {
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
+                // FORK-ONLY: outgoing DCC SEND.
+                if (client.serverExtended) Button(
                     onClick = { picker.launch("*/*") },
                     enabled = networkId != null && nick.isNotBlank(),
                 ) { Text("Send a file…") }
                 TextButton(
                     onClick = {
                         val id = networkId ?: return@TextButton
-                        val who = nick.trim()
-                        client.dccChat(id, who, open = true)
-                        onOpenBuffer(client.focusTarget(id, "=$who"))
+                        client.dccChat(id, nick.trim(), open = true, focus = true)
                     },
                     enabled = networkId != null && nick.isNotBlank(),
                 ) { Text("Start a chat") }

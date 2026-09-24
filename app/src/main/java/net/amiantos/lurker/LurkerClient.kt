@@ -341,6 +341,17 @@ open class LurkerClient {
 
     // DCC (receive side; send/chat scaffolded in DccScreen pending server API).
     val transfers = mutableStateMapOf<Int, DccTransfer>()
+
+    /** "networkId::peerLower" of every live DCC CHAT session. Seeded from each
+     *  snapshot's `dccChats` (a chat outlives its IRC link, so a disconnected
+     *  network's count too) and kept current by `dcc-chat-state`. */
+    val dccChatsLive = mutableStateSetOf<String>()
+
+    /** Inbound DCC CHAT offers awaiting an answer, by [DccChatOffer.key]. Retired on
+     *  `dcc-chat-offer-closed`, and reconciled against every snapshot's
+     *  `dccChatOffers` — a missed close would otherwise leave an Accept button
+     *  that quietly sends the peer a FRESH offer instead. */
+    val dccChatOffers = mutableStateMapOf<String, DccChatOffer>()
     var dccError by mutableStateOf<String?>(null)
     var dccEnabled by mutableStateOf(true)
         private set
@@ -579,6 +590,8 @@ open class LurkerClient {
             pendingWhois.clear()
             failedSends.clear()
             transfers.clear()
+            dccChatsLive.clear()
+            dccChatOffers.clear()
             drafts.clear()
             inputHistory.clear()
             aliases.clear()
@@ -1218,6 +1231,14 @@ open class LurkerClient {
                         return
                     }
                 }
+                // DCC CHAT lifecycle: ephemeral, aimed at the :server: pseudo-buffer
+                // with the peer in `from` — never a chat row, never a buffer.
+                when (frame.optString("type")) {
+                    "dcc-chat-offer", "dcc-chat-offer-closed", "dcc-chat-state" -> {
+                        if (networkId != null) applyDccChatEvent(networkId, frame)
+                        return
+                    }
+                }
                 val target = frame.optString("target")
                 if (target.isEmpty()) return
                 // Current-topic sync (RPL_TOPIC on join). Ephemeral, no chat row —
@@ -1807,6 +1828,24 @@ open class LurkerClient {
                     chanTypes = si.optString("chanTypes"),
                 )
             }
+            // DCC CHAT state rides every snapshot: replace this network's slice.
+            n.optJSONArray("dccChats")?.let { live ->
+                dccChatsLive.removeAll { it.startsWith("$id::") }
+                for (j in 0 until live.length()) {
+                    val nk = live.optString(j)
+                    if (nk.isNotEmpty()) dccChatsLive.add("$id::${nk.lowercase()}")
+                }
+            }
+            n.optJSONArray("dccChatOffers")?.let { offers ->
+                val pending = (0 until offers.length()).map { offers.optString(it) }.filter { it.isNotEmpty() }
+                val keys = pending.map { "$id::${it.lowercase()}" }.toSet()
+                dccChatOffers.keys.filter { it.startsWith("$id::") && it !in keys }.forEach { dccChatOffers.remove(it) }
+                // Keep a live-event entry (it knows `passive`); add any we missed.
+                for (nk in pending) {
+                    val offer = DccChatOffer(id, nk, passive = false)
+                    if (offer.key !in dccChatOffers) dccChatOffers[offer.key] = offer
+                }
+            }
             // Per-network pinned buffers, in the user's chosen order.
             n.optJSONArray("pinned")?.let { p ->
                 pins[id] = (0 until p.length()).map { p.optString(it) }
@@ -1937,6 +1976,8 @@ open class LurkerClient {
      */
     fun notifyTyping(buffer: Buffer, active: Boolean) {
         val networkId = buffer.networkId ?: return
+        // A DCC chat is a direct socket; there's no IRC target to TAGMSG.
+        if (buffer.isDccChat) return
         if (!settingBool("chat.send_typing_notifications", true)) return
         val now = System.currentTimeMillis()
         if (active && now - (typingSentAt[buffer.key] ?: 0) < 3_000) return
@@ -2843,22 +2884,87 @@ open class LurkerClient {
         }
     }
 
-    /** Open (or close) a DCC chat with [nick]. The chat lives in the "=nick" buffer. */
-    fun dccChat(networkId: Int, nick: String, open: Boolean) = io.execute {
+    /**
+     * Open (or close) a DCC chat with [nick]. The chat lives in the "=nick" buffer.
+     * Opening a peer's pending offer ACCEPTS it; closing one DECLINES it (the
+     * server's doubling, same as irssi's `/dcc chat`). Returns as soon as the
+     * offer is away — the handshake's outcome arrives as notices in `=nick`.
+     * A failure lands in [reportTo] when given (the chat the user is looking at),
+     * else in [dccError] for the DCC screen. [focus] opens the `=nick` buffer once
+     * the server has taken the request.
+     */
+    fun dccChat(
+        networkId: Int,
+        nick: String,
+        open: Boolean,
+        passive: Boolean = false,
+        reportTo: Buffer? = null,
+        focus: Boolean = false,
+    ) = io.execute {
+        val offerKey = "$networkId::${nick.lowercase()}"
+        fun fail(msg: String) {
+            post { if (reportTo != null) localNotice(reportTo, msg) else dccError = msg }
+        }
         try {
             val path = if (open) "/api/dcc/chat" else "/api/dcc/chat/close"
             val body = JSONObject().put("networkId", networkId).put("nick", nick)
+                .apply { if (open && passive) put("passive", true) }
                 .toString().toRequestBody(json)
             http.newCall(authed(path).post(body).build()).execute().use { res ->
                 if (!res.isSuccessful) {
                     val err = runCatching {
                         JSONObject(res.body?.string().orEmpty()).optString("error")
                     }.getOrNull()
-                    post { dccError = err?.ifEmpty { null } ?: "DCC chat failed (HTTP ${res.code})" }
+                    fail(err?.ifEmpty { null } ?: "DCC chat failed (HTTP ${res.code})")
+                    return@use
+                }
+                post {
+                    // Either way the offer has been answered; the server's
+                    // offer-closed confirms it, but don't leave the banner up.
+                    dccChatOffers.remove(offerKey)
+                    if (open && focus) pendingOpen = ensureBuffer(networkId, "=$nick")
                 }
             }
         } catch (e: Exception) {
-            post { dccError = "DCC chat failed: ${e.message}" }
+            fail("DCC chat failed: ${e.message}")
+        }
+    }
+
+    /** True when the `=nick` [buffer] has a live DCC session behind it. */
+    fun isDccChatLive(buffer: Buffer): Boolean {
+        val networkId = buffer.networkId ?: return false
+        return "$networkId::${buffer.peer.lowercase()}" in dccChatsLive
+    }
+
+    /** The pending inbound offer from [buffer]'s peer, if any. */
+    fun dccOfferFor(buffer: Buffer): DccChatOffer? {
+        val networkId = buffer.networkId ?: return null
+        return dccChatOffers["$networkId::${buffer.peer.lowercase()}"]
+    }
+
+    private fun applyDccChatEvent(networkId: Int, frame: JSONObject) {
+        val from = frame.optString("from")
+        if (from.isEmpty()) return
+        val key = "$networkId::${from.lowercase()}"
+        when (frame.optString("type")) {
+            "dcc-chat-offer" -> {
+                dccChatOffers[key] = DccChatOffer(networkId, from, frame.optBoolean("passive", false))
+                // A peer is waiting on an answer — worth a notification when we're
+                // not on screen. Routed to the server buffer, where the server also
+                // prints the offer.
+                if (!appForeground) {
+                    val server = buffers.firstOrNull { it.networkId == networkId && it.isServerBuffer }
+                    notificationSink?.invoke(
+                        NotifiableEvent(
+                            networkId, server?.target ?: ":server:", from,
+                            "wants to start a DCC chat", isDm = true,
+                        ),
+                    )
+                }
+            }
+            "dcc-chat-offer-closed" -> dccChatOffers.remove(key)
+            "dcc-chat-state" ->
+                if (frame.optBoolean("live", false)) dccChatsLive.add(key) else dccChatsLive.remove(key)
         }
     }
 

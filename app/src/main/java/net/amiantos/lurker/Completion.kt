@@ -68,7 +68,7 @@ object Completion {
         "me", "msg", "query", "notice", "join", "part", "close", "clear", "nick",
         "topic", "kick", "invite", "mode", "op", "deop", "voice", "devoice",
         "halfop", "dehalfop", "ban", "unban", "whois", "whowas", "raw", "quote",
-        "ns", "cs", "ms", "away", "back", "ctcp", "ping", "slap", "quit", "cycle",
+        "ns", "cs", "ms", "away", "back", "ctcp", "ping", "slap", "quit", "cycle", "dcc",
         "hop", "e2e", "list", "channels", "help",
     )
 }

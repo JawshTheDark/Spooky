@@ -34,6 +34,9 @@ sealed interface ParsedInput {
     data class Local(val message: String, val isError: Boolean) : ParsedInput
     /** Open the channel browser (/list), optionally seeded with a filter [query]. */
     data class Browse(val query: String?) : ParsedInput
+    /** Offer (or accept) a DCC CHAT with [nick], or end one when [close]. REST, not
+     *  a socket op — the outcome lands as notices in the `=nick` buffer. */
+    data class DccChat(val nick: String, val close: Boolean, val passive: Boolean = false) : ParsedInput
 }
 
 object Commands {
@@ -42,6 +45,56 @@ object Commands {
 
     fun isChannel(target: String): Boolean =
         target.isNotEmpty() && target[0] in "#&+!"
+
+    /** `=nick` names a DCC chat buffer (irssi's convention, as the server uses). */
+    fun isDccChat(target: String): Boolean = target.startsWith("=")
+
+    /** The peer behind a `=nick` DCC chat; any other target unchanged. */
+    fun dccPeer(target: String): String = if (isDccChat(target)) target.substring(1) else target
+
+    /** A usable DCC chat peer: a bare nick — not a `=buffer` name, not a channel
+     *  (which would broadcast the offer to the whole room). */
+    private fun dccNick(raw: String?): String? =
+        raw?.trim()?.takeIf { it.isNotEmpty() && !isDccChat(it) && !isChannel(it) }
+
+    /**
+     * `/dcc`, following irssi's syntax exactly as the web client does:
+     * `/dcc chat [-passive] <nick>` and `/dcc close chat <nick>` (type FIRST —
+     * the old `/dcc close <nick>` shorthand read "chat" as the nick). Transfers
+     * are managed from the DCC screen.
+     */
+    private fun parseDcc(rest: String): ParsedInput {
+        val parts = rest.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        fun err(msg: String) = ParsedInput.Local(msg, isError = true)
+        return when (parts.getOrNull(0)?.lowercase()) {
+            "chat" -> {
+                val flags = parts.drop(1).filter { it.startsWith("-") }
+                val args = parts.drop(1).filterNot { it.startsWith("-") }
+                flags.firstOrNull { !it.equals("-passive", true) }?.let {
+                    return err("Unknown option \"$it\". Usage: /dcc chat [-passive] <nick>")
+                }
+                // `/dcc chat close bob` read literally would OFFER a chat to "close".
+                if (args.size > 1) {
+                    return err(
+                        if (args[0].equals("close", true)) "To end a chat: /dcc close chat <nick>"
+                        else "Usage: /dcc chat [-passive] <nick>",
+                    )
+                }
+                val nick = dccNick(args.getOrNull(0)) ?: return err("Usage: /dcc chat [-passive] <nick>")
+                ParsedInput.DccChat(nick, close = false, passive = flags.isNotEmpty())
+            }
+            "close" -> when (parts.getOrNull(1)?.lowercase()) {
+                "chat" -> {
+                    val nick = dccNick(parts.getOrNull(2))
+                    if (nick == null || parts.size > 3) err("Usage: /dcc close chat <nick>")
+                    else ParsedInput.DccChat(nick, close = true)
+                }
+                "send", "get" -> err("File transfers are managed from the DCC transfers screen.")
+                else -> err("Usage: /dcc close chat <nick>")
+            }
+            else -> err("Usage: /dcc chat [-passive] <nick> · /dcc close chat <nick>")
+        }
+    }
 
     /**
      * Expand a user alias once (single-pass, no loops — mirrors the web's
@@ -184,7 +237,13 @@ object Commands {
             "ban" -> modeForNicks(rest, currentTarget, "+b") ?: err("Usage: /ban <mask...>")
             "unban" -> modeForNicks(rest, currentTarget, "-b") ?: err("Usage: /unban <mask...>")
 
-            "whois" -> if (rest.isEmpty()) err("Usage: /whois <nick>") else raw("WHOIS $rest")
+            // In a `=nick` DCC chat a bare /whois or /ping means the PEER — the
+            // buffer name must never reach the IRC wire.
+            "whois" -> when {
+                rest.isNotEmpty() -> raw("WHOIS ${dccPeer(rest)}")
+                isDccChat(currentTarget) -> raw("WHOIS ${dccPeer(currentTarget)}")
+                else -> err("Usage: /whois <nick>")
+            }
             "whowas" -> if (rest.isEmpty()) err("Usage: /whowas <nick>") else raw("WHOWAS $rest")
 
             "raw", "quote" -> if (rest.isEmpty()) err("Usage: /raw <line>") else raw(rest)
@@ -198,9 +257,16 @@ object Commands {
 
             "ctcp" -> {
                 val (who, body) = splitTargetAndBody(rest) ?: return err("Usage: /ctcp <nick> <TYPE> [args]")
-                raw("PRIVMSG $who :${body.uppercase()}")
+                // A CTCP rides IRC, so a `=nick` buffer name becomes its peer.
+                raw("PRIVMSG ${dccPeer(who)} :${body.uppercase()}")
             }
-            "ping" -> if (rest.isEmpty()) err("Usage: /ping <nick>") else raw("PRIVMSG $rest :PING")
+            "ping" -> when {
+                rest.isNotEmpty() -> raw("PRIVMSG ${dccPeer(rest)} :PING")
+                isDccChat(currentTarget) -> raw("PRIVMSG ${dccPeer(currentTarget)} :PING")
+                else -> err("Usage: /ping <nick>")
+            }
+
+            "dcc" -> parseDcc(rest)
 
             "slap" -> if (rest.isEmpty()) err("Usage: /slap <nick>")
                 else ParsedInput.Ops(listOf(WireOp("action", text = SLAP.format(rest))))
@@ -268,6 +334,7 @@ object Commands {
         appendLine("/op, /deop, /voice, /devoice, /ban, /unban")
         appendLine("/away, /back, /ctcp, /ping, /slap, /cycle, /quit")
         appendLine("/ns, /cs, /ms, /raw <line>")
+        appendLine("/dcc chat [-passive] <nick>, /dcc close chat <nick>")
         append("Prefix a literal slash with // to send it as a message.")
     }
 }

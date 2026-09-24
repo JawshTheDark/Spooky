@@ -165,4 +165,39 @@ class CommandsTest {
     fun channelsIsAliasForList() {
         assertTrue(Commands.parse("/channels", "#chan", hasNetwork = true) is ParsedInput.Browse)
     }
+
+    // ---- DCC CHAT (irssi syntax, mirroring the web client) ----------------
+
+    private fun dcc(input: String) = Commands.parse(input, "#chan", hasNetwork = true)
+
+    @Test
+    fun dccChatOffersToANick() {
+        assertEquals(ParsedInput.DccChat("bob", close = false, passive = false), dcc("/dcc chat bob"))
+        assertEquals(ParsedInput.DccChat("bob", close = false, passive = true), dcc("/dcc chat -passive bob"))
+    }
+
+    @Test
+    fun dccCloseIsTypeFirst() {
+        assertEquals(ParsedInput.DccChat("bob", close = true), dcc("/dcc close chat bob"))
+        // The old shorthand would have closed a chat with a peer named "chat".
+        assertTrue(dcc("/dcc close bob") is ParsedInput.Local)
+        // Read literally this would OFFER a chat to "close".
+        assertTrue(dcc("/dcc chat close bob") is ParsedInput.Local)
+    }
+
+    @Test
+    fun dccRefusesBufferNamesChannelsAndUnknownFlags() {
+        assertTrue(dcc("/dcc chat =bob") is ParsedInput.Local)
+        assertTrue(dcc("/dcc chat #room") is ParsedInput.Local)
+        assertTrue(dcc("/dcc chat -active bob") is ParsedInput.Local)
+        assertTrue(dcc("/dcc chat") is ParsedInput.Local)
+    }
+
+    @Test
+    fun bareWhoisAndPingInADccChatTargetThePeer() {
+        assertEquals("WHOIS bob", ops("/whois", target = "=bob").ops[0].line)
+        assertEquals("PRIVMSG bob :PING", ops("/ping", target = "=bob").ops[0].line)
+        // Never put the `=` buffer name on the IRC wire.
+        assertEquals("PRIVMSG bob :VERSION", ops("/ctcp =bob version").ops[0].line)
+    }
 }

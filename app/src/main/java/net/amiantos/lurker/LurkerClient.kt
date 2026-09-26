@@ -2446,7 +2446,7 @@ open class LurkerClient {
             }
             "mode" -> "$nick set mode" + (reason?.let { " $it" } ?: "")
             "topic" -> if (reason != null) "$nick set the topic: $reason" else "$nick cleared the topic"
-            "invite" -> "$nick invited you" + (reason?.let { " to $it" } ?: "")
+            "invite" -> inviteLine(nick, e)
             else -> reason ?: type
         }
     }
@@ -3529,6 +3529,21 @@ internal fun relayNotifyNetwork(
  * "gnat isn't on this network." rendered under a sender called "null"
  * (stephanos, #lurker). `isNull` is true for absent and null alike.
  */
+/**
+ * An invite's system line. The server sends two shapes: a channel line
+ * (`nick` = inviter, `invited` = who — our own /invite, or one an op sees via
+ * invite-notify) and the invite TO US, which names the inviter in `from` and the
+ * channel in `channel` and has no `nick` at all. Reading neither field was the
+ * mangled "Jawsh invited you" in the channel you'd just invited someone to.
+ */
+internal fun inviteLine(nick: String, e: JSONObject): String {
+    val who = nick.takeIf { it.isNotEmpty() && it != "*" } ?: e.optString("from").ifEmpty { "Someone" }
+    val invited = e.optString("invited")
+    if (invited.isNotEmpty()) return "$who invited $invited"
+    val channel = e.optString("channel").ifEmpty { e.optString("text") }
+    return "$who invited you" + (if (channel.isNotBlank()) " to $channel" else "")
+}
+
 internal fun eventNick(e: JSONObject): String =
     if (e.isNull("nick")) "*" else e.optString("nick", "*")
 

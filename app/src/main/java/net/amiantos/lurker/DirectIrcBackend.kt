@@ -14,6 +14,7 @@ import org.kitteh.irc.client.library.event.channel.ChannelPartEvent
 import org.kitteh.irc.client.library.event.channel.ChannelTopicEvent
 import org.kitteh.irc.client.library.event.channel.ChannelUsersUpdatedEvent
 import org.kitteh.irc.client.library.event.capabilities.CapabilitiesSupportedListEvent
+import org.kitteh.irc.client.library.event.helper.ServerMessageEvent
 import org.kitteh.irc.client.library.event.client.ClientNegotiationCompleteEvent
 import org.kitteh.irc.client.library.event.client.ClientReceiveCommandEvent
 import org.kitteh.irc.client.library.event.client.ClientReceiveNumericEvent
@@ -24,6 +25,8 @@ import org.kitteh.irc.client.library.event.user.PrivateNoticeEvent
 import org.kitteh.irc.client.library.event.user.UserNickChangeEvent
 import org.kitteh.irc.client.library.event.user.UserQuitEvent
 import org.kitteh.irc.client.library.feature.auth.SaslPlain
+import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
 /** Registration/auth-rejection numerics worth surfacing: bad password/token
@@ -303,27 +306,27 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
 
         @Handler
         fun onChannelMessage(e: ChannelMessageEvent) =
-            addMessage(networkId, e.channel.name, "message", e.actor.nick, e.message, mask = e.actor.name)
+            addMessage(networkId, e.channel.name, "message", e.actor.nick, e.message, mask = e.actor.name, src = e)
 
         @Handler
         fun onPrivateMessage(e: PrivateMessageEvent) =
-            addMessage(networkId, e.actor.nick, "message", e.actor.nick, e.message, dm = true, mask = e.actor.name)
+            addMessage(networkId, e.actor.nick, "message", e.actor.nick, e.message, dm = true, mask = e.actor.name, src = e)
 
         @Handler
         fun onChannelAction(e: ChannelCtcpEvent) {
             val m = e.message
             if (m.startsWith("ACTION ")) {
-                addMessage(networkId, e.channel.name, "action", e.actor.nick, m.removePrefix("ACTION "), mask = e.actor.name)
+                addMessage(networkId, e.channel.name, "action", e.actor.nick, m.removePrefix("ACTION "), mask = e.actor.name, src = e)
             }
         }
 
         @Handler
         fun onChannelNotice(e: ChannelNoticeEvent) =
-            addMessage(networkId, e.channel.name, "notice", e.actor.nick, e.message, mask = e.actor.name)
+            addMessage(networkId, e.channel.name, "notice", e.actor.nick, e.message, mask = e.actor.name, src = e)
 
         @Handler
         fun onPrivateNotice(e: PrivateNoticeEvent) =
-            addMessage(networkId, e.actor.nick, "notice", e.actor.nick, e.message, dm = true, mask = e.actor.name)
+            addMessage(networkId, e.actor.nick, "notice", e.actor.nick, e.message, dm = true, mask = e.actor.name, src = e)
 
         @Handler
         fun onJoin(e: ChannelJoinEvent) = post {
@@ -405,7 +408,17 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
 
     private fun addMessage(
         networkId: Int, target: String, type: String, nick: String, text: String,
-        dm: Boolean = false, mask: String = nick,
+        dm: Boolean = false, mask: String = nick, src: ServerMessageEvent? = null,
+    ) {
+        // Read the IRCv3 tags on KICL's thread, before hopping to main.
+        val msgid = src?.getTag("msgid")?.orElse(null)?.value?.orElse(null)
+        val serverTime = src?.getTag("time")?.orElse(null)?.value?.orElse(null)
+        addMessageOnMain(networkId, target, type, nick, text, dm, mask, msgid, serverTime)
+    }
+
+    private fun addMessageOnMain(
+        networkId: Int, target: String, type: String, nick: String, text: String,
+        dm: Boolean, mask: String, msgid: String?, serverTime: String?,
     ) = post {
         val myNick = networks[networkId]?.nick
         val self = nick.equals(myNick, true)
@@ -415,7 +428,14 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
         else IgnoreMatch.evaluate(ignores, networkId, if (dm) null else target, dm, mask, type, text)
         if (ignore.drop) return@post
         val b = ensureBuffer(networkId, target)
-        val msg = Msg(nextMsgId.getAndIncrement(), type, nick, text, self = self)
+        val msg = Msg(
+            nextMsgId.getAndIncrement(), type, nick, text, self = self,
+            time = serverTime ?: Instant.now().toString(), msgid = msgid,
+        )
+        // A bouncer replays its buffer on every reconnect (and after a restart,
+        // on top of the tail we restored from disk). Without this, each replayed
+        // line got a fresh local id and appeared again.
+        if (isReplayDuplicate(messagesByBuffer[b.key].orEmpty(), msg)) return@post
         if (!mergeInto(b.key, listOf(msg), replace = false)) return@post
         val highlight = !ignore.suppressHighlight && (dm || (myNick != null && text.contains(myNick, true)))
         if (!ignore.suppressUnread) {
@@ -474,7 +494,8 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
     /** No echo-message cap yet → optimistically append our own line. */
     private fun echoSelf(buffer: Buffer, type: String, text: String) = post {
         val nick = networks[buffer.networkId]?.nick ?: "me"
-        mergeInto(buffer.key, listOf(Msg(nextMsgId.getAndIncrement(), type, nick, text, self = true)), replace = false)
+        val msg = Msg(nextMsgId.getAndIncrement(), type, nick, text, self = true, time = Instant.now().toString())
+        mergeInto(buffer.key, listOf(msg), replace = false)
     }
 
     override fun open(buffer: Buffer) {} // no server history to hydrate; buffer is local
@@ -562,3 +583,31 @@ class KiclManager {
     fun shutdown(id: Int) { clients.remove(id)?.let { runCatching { it.shutdown() } } }
     fun shutdownAll() { clients.values.forEach { runCatching { it.shutdown() } }; clients.clear() }
 }
+
+/** How far a replayed copy of OUR OWN line may sit from the optimistic copy we
+ *  appended at send time: those are stamped by our clock, the replay by the
+ *  server's, so allow for skew. Other people's lines compare server-time exactly. */
+private const val SELF_ECHO_WINDOW_MS = 60_000L
+
+/** Only the recent tail can hold a replay's original; bouncers replay the tail. */
+private const val REPLAY_SCAN = 500
+
+/**
+ * True when [incoming] is a bouncer replay of a line [existing] already holds.
+ * Matched on IRCv3 `msgid` when the server sends one; otherwise on the same
+ * type, nick and text at the same `server-time`. A line with neither tag can't
+ * be told apart from someone genuinely repeating themselves, so it's kept.
+ */
+internal fun isReplayDuplicate(existing: List<Msg>, incoming: Msg): Boolean {
+    val tail = if (existing.size > REPLAY_SCAN) existing.subList(existing.size - REPLAY_SCAN, existing.size) else existing
+    incoming.msgid?.let { id -> if (tail.any { it.msgid == id }) return true }
+    val at = parseInstant(incoming.time) ?: return false
+    val window = if (incoming.self) SELF_ECHO_WINDOW_MS else 0L
+    return tail.any { m ->
+        !m.system && m.type == incoming.type && m.text == incoming.text &&
+            m.nick.equals(incoming.nick, ignoreCase = true) &&
+            parseInstant(m.time)?.let { Duration.between(it, at).abs().toMillis() <= window } == true
+    }
+}
+
+private fun parseInstant(iso: String?): Instant? = iso?.let { runCatching { Instant.parse(it) }.getOrNull() }

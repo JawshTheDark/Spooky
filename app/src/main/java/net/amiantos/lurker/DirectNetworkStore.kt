@@ -136,6 +136,7 @@ class DirectNetworkStore(context: Context) {
                     put("id", msg.id); put("type", msg.type); put("nick", msg.nick)
                     put("text", msg.text); put("self", msg.self); put("system", msg.system)
                     msg.time?.let { put("time", it) }
+                    msg.msgid?.let { put("msgid", it) }
                     msg.level?.let { put("level", it) }
                     put("e2e", msg.e2e)
                 })
@@ -161,6 +162,7 @@ class DirectNetworkStore(context: Context) {
                     text = m.optString("text"), self = m.optBoolean("self"),
                     time = m.optString("time").ifEmpty { null }, system = m.optBoolean("system"),
                     level = m.optString("level").ifEmpty { null }, e2e = m.optBoolean("e2e"),
+                    msgid = m.optString("msgid").ifEmpty { null },
                 )
             }
             PersistedBuffer(

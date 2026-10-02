@@ -127,6 +127,9 @@ data class Msg(
     /** Set on an undelivered-send line; keys the [FailedSend] holding the original
      *  text so the row can offer Resend / Discard. */
     val failedId: String? = null,
+    /** IRCv3 `msgid` (direct mode). A bouncer replays its buffer with the same
+     *  ids on every reconnect, so this is what tells a replay from a new line. */
+    val msgid: String? = null,
 )
 
 /** A message that never made it out — the socket was down, the server rejected it,

@@ -20,6 +20,7 @@ import org.kitteh.irc.client.library.event.client.ClientReceiveCommandEvent
 import org.kitteh.irc.client.library.event.client.ClientReceiveNumericEvent
 import org.kitteh.irc.client.library.event.connection.ClientConnectionClosedEvent
 import org.kitteh.irc.client.library.event.connection.ClientConnectionFailedEvent
+import org.kitteh.irc.client.library.event.user.PrivateCtcpQueryEvent
 import org.kitteh.irc.client.library.event.user.PrivateMessageEvent
 import org.kitteh.irc.client.library.event.user.PrivateNoticeEvent
 import org.kitteh.irc.client.library.event.user.UserNickChangeEvent
@@ -27,6 +28,7 @@ import org.kitteh.irc.client.library.event.user.UserQuitEvent
 import org.kitteh.irc.client.library.feature.auth.SaslPlain
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /** Registration/auth-rejection numerics worth surfacing: bad password/token
@@ -138,6 +140,10 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
                 // control connection — it discovers upstream networks. Children
                 // (type="direct", username user/network) are normal connections.
                 client.eventManager.registerEventListener(Listener(net.id, client, isSojuControl = net.type == "soju"))
+                // Replace, never stack: a second live client for the same network
+                // doubled every incoming line (both deliver) and kept the old
+                // connection running unseen.
+                manager.shutdown(net.id)
                 manager.put(net.id, client)
                 client.connect()
             }.onFailure { e ->
@@ -247,7 +253,16 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
             if (!e.willAttemptReconnect()) {
                 val cause = e.cause.map { it.message ?: it.javaClass.simpleName }.orElse(null)
                 surfaceError(if (cause != null) "Disconnected: $cause" else "Disconnected from ${netName()}")
+                forgetIfDead()
             }
+        }
+
+        /** KICL won't retry this client: drop it from the manager. While it sat
+         *  there, the return-to-app and network-change revivals (which only start
+         *  networks with NO client) skipped it, so the network stayed down until a
+         *  manual reconnect. A user disconnect already removed it — leave that alone. */
+        private fun forgetIfDead() {
+            if (manager.get(networkId) === client) manager.shutdown(networkId)
         }
 
         // KICL's connect() is async — a DNS/TLS/refused failure happens on a Netty
@@ -259,6 +274,7 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
             connected = networks.values.any { it.connected }
             val cause = e.cause.map { it.message ?: it.javaClass.simpleName }.orElse("connection failed")
             surfaceError("Couldn't connect to ${netName()}: $cause")
+            if (!e.willAttemptReconnect()) forgetIfDead()
         }
 
         // Registration rejections: soju/ZNC send `464 :<reason>` (bad password/token)
@@ -308,9 +324,27 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
         fun onChannelMessage(e: ChannelMessageEvent) =
             addMessage(networkId, e.channel.name, "message", e.actor.nick, e.message, mask = e.actor.name, src = e)
 
+        /** The DM buffer a private line belongs in: the sender's when it was sent
+         *  TO us, otherwise its target. A bouncer replays (and relays from your
+         *  other devices) the DMs YOU sent, as `:you PRIVMSG bob` — filing those
+         *  under the sender put your half of every conversation in a buffer named
+         *  after yourself. */
+        private fun dmBuffer(toClient: Boolean, sender: String, target: String) =
+            if (toClient) sender else target
+
         @Handler
         fun onPrivateMessage(e: PrivateMessageEvent) =
-            addMessage(networkId, e.actor.nick, "message", e.actor.nick, e.message, dm = true, mask = e.actor.name, src = e)
+            addMessage(networkId, dmBuffer(e.isToClient, e.actor.nick, e.target), "message", e.actor.nick, e.message, dm = true, mask = e.actor.name, src = e)
+
+        // /me in a DM arrives as a private CTCP ACTION, which nothing handled — DM
+        // actions just vanished. (Other CTCP queries stay KICL's to answer.)
+        @Handler
+        fun onPrivateAction(e: PrivateCtcpQueryEvent) {
+            val m = e.message
+            if (m.startsWith("ACTION ")) {
+                addMessage(networkId, dmBuffer(e.isToClient, e.actor.nick, e.target), "action", e.actor.nick, m.removePrefix("ACTION "), dm = true, mask = e.actor.name, src = e)
+            }
+        }
 
         @Handler
         fun onChannelAction(e: ChannelCtcpEvent) {
@@ -326,7 +360,7 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
 
         @Handler
         fun onPrivateNotice(e: PrivateNoticeEvent) =
-            addMessage(networkId, e.actor.nick, "notice", e.actor.nick, e.message, dm = true, mask = e.actor.name, src = e)
+            addMessage(networkId, dmBuffer(e.isToClient, e.actor.nick, e.target), "notice", e.actor.nick, e.message, dm = true, mask = e.actor.name, src = e)
 
         @Handler
         fun onJoin(e: ChannelJoinEvent) = post {
@@ -467,18 +501,36 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
             return
         }
         for (op in ops) {
+            // KICL throws on CR/LF/NUL in a message (and on a space in a target),
+            // and this runs on the main thread — so a pasted multi-line message, or
+            // a sent Quote ("> …" + newline), crashed the app. IRC has no multi-line
+            // message: send each line as its own, the way other clients do.
+            // Lurker's server already splits the same way.
+            fun guarded(block: () -> Unit) = try {
+                block()
+            } catch (e: Exception) {
+                localNotice(buffer, "Couldn't send: ${e.message ?: e.javaClass.simpleName}")
+            }
             when (op.type) {
                 "send" -> {
                     val target = op.target ?: buffer.target
-                    client.sendMessage(target, op.text ?: "")
-                    if (op.target == null) echoSelf(buffer, "message", op.text ?: "")
+                    for (line in ircLines(op.text)) {
+                        guarded {
+                            client.sendMessage(target, line)
+                            if (op.target == null) echoSelf(buffer, "message", line)
+                        }
+                    }
                 }
-                "action" -> {
-                    client.sendCtcpMessage(buffer.target, "ACTION ${op.text ?: ""}")
-                    echoSelf(buffer, "action", op.text ?: "")
+                "action" -> for (line in ircLines(op.text)) {
+                    guarded {
+                        client.sendCtcpMessage(buffer.target, "ACTION $line")
+                        echoSelf(buffer, "action", line)
+                    }
                 }
-                "notice" -> client.sendNotice(op.target ?: buffer.target, op.text ?: "")
-                "raw" -> client.sendRawLine(op.line ?: "")
+                "notice" -> for (line in ircLines(op.text)) {
+                    guarded { client.sendNotice(op.target ?: buffer.target, line) }
+                }
+                "raw" -> for (line in ircLines(op.line)) guarded { client.sendRawLine(line) }
                 "join" -> op.channel?.let { ch -> io.execute { runCatching { client.addChannel(ch) } } }
                 "part" -> client.getChannel(op.target ?: buffer.target).ifPresent { it.part(op.reason ?: "") }
                 "close" -> {
@@ -511,6 +563,21 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
     override fun onBackground() {
         appForeground = false
         persistMessages()
+    }
+
+    /**
+     * See [LurkerClient.onNetworkAvailable]. KICL notices a dead socket only by
+     * its own ping timeout, minutes later — so after a switch, reconnect every
+     * live client now (soju children included), and after an outage reconnect the
+     * ones that are down. Autoconnect networks with no client at all are started.
+     */
+    override fun onNetworkAvailable(switched: Boolean) {
+        for ((id, c) in manager.entries()) {
+            if (switched || networks[id]?.connected != true) {
+                io.execute { runCatching { c.reconnect("Network changed") } }
+            }
+        }
+        store.list().filter { it.autoconnect && manager.get(it.id) == null }.forEach { connectNetwork(it) }
     }
 
     override fun signOut() {
@@ -560,7 +627,8 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
     override fun networkAction(id: Int, action: String) {
         val net = store.get(id) ?: return
         when (action) {
-            "connect" -> connectNetwork(net)
+            // Already up: connecting again would only replace a working link.
+            "connect" -> if (manager.get(id) == null || networks[id]?.connected != true) connectNetwork(net)
             "disconnect" -> {
                 manager.shutdown(id)
                 post { networks[id]?.let { networks[id] = it.copy(connected = false) } }
@@ -575,14 +643,21 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
     }
 }
 
-/** Holds the live KICL clients keyed by local networkId. */
+/** Holds the live KICL clients keyed by local networkId. Touched from the main
+ *  thread, the io executor and KICL's Netty threads, hence concurrent. */
 class KiclManager {
-    private val clients = mutableMapOf<Int, Client>()
+    private val clients = ConcurrentHashMap<Int, Client>()
     fun put(id: Int, client: Client) { clients[id] = client }
     fun get(id: Int): Client? = clients[id]
+    fun entries(): List<Pair<Int, Client>> = clients.entries.map { it.key to it.value }
     fun shutdown(id: Int) { clients.remove(id)?.let { runCatching { it.shutdown() } } }
     fun shutdownAll() { clients.values.forEach { runCatching { it.shutdown() } }; clients.clear() }
 }
+
+/** Composer text as IRC lines: split on any line break, NULs dropped (KICL
+ *  rejects both), blank lines skipped. */
+internal fun ircLines(text: String?): List<String> =
+    text.orEmpty().replace("\u0000", "").split(Regex("\r\n|\r|\n")).filter { it.isNotBlank() }
 
 /** How far a replayed copy of OUR OWN line may sit from the optimistic copy we
  *  appended at send time: those are stamped by our clock, the replay by the

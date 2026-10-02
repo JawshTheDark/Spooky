@@ -406,6 +406,25 @@ open class LurkerClient {
         .pingInterval(30, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * REST calls get their own timeouts. [http] is tuned for the long-lived
+     * WebSocket (no read timeout), and every REST call runs one at a time on the
+     * single [io] thread — so one request stuck on a dead connection (a network
+     * switch mid-request) used to stall every call queued behind it: settings,
+     * DCC, uploads, network actions. Shares [http]'s connection pool.
+     */
+    private val rest by lazy {
+        http.newBuilder()
+            .pingInterval(0, TimeUnit.MILLISECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /** Uploads: the server answers only after handing the file on to the upload
+     *  provider (or staging a DCC send), which can outlast [rest]'s 30s. */
+    private val uploadHttp by lazy { rest.newBuilder().readTimeout(5, TimeUnit.MINUTES).build() }
+
     protected val main = Handler(Looper.getMainLooper())
     protected val io = Executors.newSingleThreadExecutor()
     private val json = "application/json; charset=utf-8".toMediaType()
@@ -507,7 +526,7 @@ open class LurkerClient {
             }.toString().toRequestBody(json)
             val loginUrl = if (hosted) "$HOSTED_LURKER_BASE/_cp/auth/app/login" else "$base/api/auth/login/token"
             val req = Request.Builder().url(loginUrl).post(body).build()
-            http.newCall(req).execute().use { res ->
+            rest.newCall(req).execute().use { res ->
                 val text = res.body?.string().orEmpty()
                 if (!res.isSuccessful) {
                     // 401/403 = bad creds; other codes = server/proxy problem.
@@ -559,19 +578,34 @@ open class LurkerClient {
 
     /** Tear down the session: close the socket, forget the token, reset state. */
     open fun signOut() {
-        // Wipe preview state with the session: an in-air response must not refill
-        // the store we just emptied, which would put the previous account's
-        // metadata back in cache and POST its URLs under the next account's token.
-        ServerPreviews.store.reset()
         intentionalClose = true
         started = false
         ws?.close(1000, "sign out")
         ws = null
-        io.execute { revokeSession() }
+        // Capture before clearing: revokeSession runs later on the io thread, and
+        // reading `token` there found it already null — so sign-out never actually
+        // revoked the session server-side.
+        val revokeToken = token
+        val revokeBase = baseUrl
+        io.execute { revokeSession(revokeToken, revokeBase) }
         prefs?.clearSession()
         token = null
         maxMessageId = 0
-        post {
+        post { resetSessionState() }
+    }
+
+    /**
+     * Forget everything the previous session left in memory. The client is
+     * process-scoped, so a sign-in after a sign-out (or after the server expired
+     * the session) happens without process death — none of this may leak into
+     * the next account. Main thread.
+     */
+    private fun resetSessionState() {
+        // Wipe preview state with the session: an in-air response must not refill
+        // the store we just emptied, which would put the previous account's
+        // metadata back in cache and POST its URLs under the next account's token.
+        ServerPreviews.store.reset()
+        run {
             loggedIn = false
             connected = false
             status = null
@@ -694,7 +728,7 @@ open class LurkerClient {
                     .put("client_uri", OAuth.CLIENT_URI)
                     .put("redirect_uris", JSONArray().put(redirect))
                     .toString().toRequestBody(json)
-                http.newCall(Request.Builder().url(registerEp).post(body).build()).execute().use { res ->
+                rest.newCall(Request.Builder().url(registerEp).post(body).build()).execute().use { res ->
                     val text = res.body?.string().orEmpty()
                     if (res.code == 429) {
                         return fail("The server is rate-limiting app registrations right now. Try again in a few minutes.")
@@ -758,7 +792,7 @@ open class LurkerClient {
                 .add("code_verifier", pending.verifier)
                 .build()
             var tok = ""
-            http.newCall(Request.Builder().url(pending.tokenEndpoint).post(form).build()).execute().use { res ->
+            rest.newCall(Request.Builder().url(pending.tokenEndpoint).post(form).build()).execute().use { res ->
                 val text = res.body?.string().orEmpty()
                 val err = runCatching { JSONObject(text).optString("error") }.getOrNull().orEmpty()
                 if (res.code == 401 || err == "invalid_client") {
@@ -812,7 +846,7 @@ open class LurkerClient {
     private fun getJson(url: String): JSONObject? = try {
         val b = Request.Builder().url(url)
         token?.let { b.header("Authorization", "Bearer $it") }
-        http.newCall(b.build()).execute().use { res ->
+        rest.newCall(b.build()).execute().use { res ->
             if (!res.isSuccessful) null
             else runCatching { JSONObject(res.body?.string().orEmpty()) }.getOrNull()
         }
@@ -820,15 +854,15 @@ open class LurkerClient {
         null
     }
 
-    private fun revokeSession() {
-        val t = token ?: return
+    private fun revokeSession(t: String?, base: String) {
+        if (t == null || base.isEmpty()) return
         try {
             val req = Request.Builder()
-                .url("$baseUrl/api/auth/logout")
+                .url("$base/api/auth/logout")
                 .header("Authorization", "Bearer $t")
                 .post(ByteArray(0).toRequestBody(null))
                 .build()
-            http.newCall(req).execute().close()
+            rest.newCall(req).execute().close()
         } catch (_: Exception) {
             // Best-effort; the local token is already gone either way.
         }
@@ -879,6 +913,26 @@ open class LurkerClient {
         }
     }
 
+    /**
+     * The device's network came back, or the default network changed (Wi-Fi <->
+     * mobile). Called by [NetworkMonitor] on the main thread.
+     *
+     * A socket rides the network it was opened on, so after a switch it's dead
+     * even though nothing has said so yet — okhttp only notices when a ping goes
+     * unanswered, and by then the backoff may be up to 30s. Reconnect now instead,
+     * the way HexDroid and other Android IRC clients do. A network merely coming
+     * back only matters if we're down.
+     */
+    open fun onNetworkAvailable(switched: Boolean) {
+        if (!loggedIn || token == null || intentionalClose) return
+        if (!switched && (connected || connecting)) return
+        DebugLog.i("net", if (switched) "network changed — reconnecting" else "network back — reconnecting")
+        backoffMs = INITIAL_BACKOFF
+        cancelScheduledReconnect()
+        connecting = false
+        openSocket(maxMessageId.takeIf { it > 0 })
+    }
+
     /** Called from the Activity's ON_STOP — remember when we left. */
     open fun onBackground() {
         appForeground = false
@@ -911,7 +965,7 @@ open class LurkerClient {
             val out = runCatching {
                 val body = JSONObject().put("urls", JSONArray(urls.take(20)))
                     .toString().toRequestBody(json)
-                http.newCall(authed("/api/link-preview/resolve").post(body).build()).execute().use { res ->
+                rest.newCall(authed("/api/link-preview/resolve").post(body).build()).execute().use { res ->
                     if (res.code == 429) {
                         DebugLog.w("preview", "rate limited; retry-after=${res.header("Retry-After")}")
                         return@runCatching null
@@ -941,7 +995,7 @@ open class LurkerClient {
      */
     fun fetchServerConfig() = io.execute {
         runCatching {
-            http.newCall(Request.Builder().url("$baseUrl/api/config").build()).execute().use { res ->
+            rest.newCall(Request.Builder().url("$baseUrl/api/config").build()).execute().use { res ->
                 if (!res.isSuccessful) return@execute
                 val feats = JSONObject(res.body?.string().orEmpty()).optJSONObject("features")
                     ?: return@execute
@@ -953,7 +1007,7 @@ open class LurkerClient {
 
     private fun fetchNetworkNames() {
         try {
-            http.newCall(authed("/api/networks").build()).execute().use { res ->
+            rest.newCall(authed("/api/networks").build()).execute().use { res ->
                 if (!res.isSuccessful) return
                 val arr = JSONObject(res.body?.string().orEmpty()).optJSONArray("networks") ?: return
                 val configs = mutableListOf<NetworkConfig>()
@@ -993,7 +1047,7 @@ open class LurkerClient {
     open fun reorderNetworks(ids: List<Int>) = io.execute {
         try {
             val body = JSONObject().put("ids", org.json.JSONArray(ids)).toString().toRequestBody(json)
-            http.newCall(authed("/api/networks/reorder").post(body).build()).execute().use { res ->
+            rest.newCall(authed("/api/networks/reorder").post(body).build()).execute().use { res ->
                 if (!res.isSuccessful) {
                     post { networksError = "reorder failed (HTTP ${res.code})" }
                 }
@@ -1067,8 +1121,10 @@ open class LurkerClient {
                     connecting = false
                     // A 401 means the saved token is dead — don't spin on it.
                     if (code == 401) {
-                        status = "Session expired — please sign in again."
                         forceSignOutLocally()
+                        // `status` isn't shown anywhere once signed out; the sign-in
+                        // screen shows authError, so say it there.
+                        authError = "Your session expired — please sign in again."
                     } else if (code == 426) {
                         // Protocol handshake refused: this build is older than the
                         // server's minimum. Retrying can't help — say so legibly.
@@ -1105,10 +1161,17 @@ open class LurkerClient {
         })
     }
 
+    /** The server rejected our token (401). Same local teardown as [signOut] — the
+     *  previous account's buffers and messages must not carry into the next
+     *  sign-in — minus the revoke, which a dead token can't do. Main thread. */
     private fun forceSignOutLocally() {
+        intentionalClose = true
+        started = false
+        ws = null
         prefs?.clearSession()
         token = null
-        loggedIn = false
+        maxMessageId = 0
+        resetSessionState()
     }
 
     private fun scheduleReconnect() {
@@ -2152,7 +2215,17 @@ open class LurkerClient {
         val ids = existing.mapNotNull { if (it.id > 0) it.id else null }.toHashSet()
         val add = newMsgs.filter { it.id <= 0 || ids.add(it.id) }
         if (add.isEmpty()) return false
-        messagesByBuffer[key] = ensureOrdered(existing + add)
+        var merged = ensureOrdered(existing + add)
+        // Nothing used to trim a buffer, so a busy channel left running all day
+        // held every line it ever received — and each new line copies the whole
+        // list. Cap the buffers you're NOT looking at (trimming the open one would
+        // yank the scroll position); with a server behind us the trimmed history
+        // is one "Load older" away.
+        if (merged.size > MAX_BUFFER_MESSAGES && key != activeKey) {
+            merged = merged.takeLast(KEEP_BUFFER_MESSAGES)
+            if (serverFeatures) hasMoreOlder[key] = true
+        }
+        messagesByBuffer[key] = merged
         return true
     }
 
@@ -2354,7 +2427,7 @@ open class LurkerClient {
         if (arr == null) return emptyList()
         val out = ArrayList<Msg>(arr.length())
         for (i in 0 until arr.length()) {
-            parseEvent(arr.getJSONObject(i))?.let(out::add)
+            parseEvent(arr.optJSONObject(i) ?: continue)?.let(out::add)
         }
         return out
     }
@@ -2659,7 +2732,12 @@ open class LurkerClient {
                 "clear" -> frame.put("type", "clear-buffer").put("target", target)
                 else -> continue
             }
-            socket.send(frame.toString())
+            // okhttp refuses (false) once the socket has failed or closed, and the
+            // frame is gone — surface a user message now rather than after the
+            // ack timeout.
+            if (!socket.send(frame.toString())) {
+                frame.optString("clientId").takeIf { it.isNotEmpty() }?.let { failSend(it, "offline") }
+            }
         }
     }
 
@@ -2679,7 +2757,7 @@ open class LurkerClient {
                 val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("image", filename, fileBody)
                     .build()
-                http.newCall(authed("/api/uploads").post(body).build()).execute().use { res ->
+                uploadHttp.newCall(authed("/api/uploads").post(body).build()).execute().use { res ->
                     val text = res.body?.string().orEmpty()
                     if (!res.isSuccessful) {
                         val err = runCatching { JSONObject(text).optString("error") }.getOrNull()
@@ -2702,7 +2780,7 @@ open class LurkerClient {
 
     open fun loadNetworkConfigs() = io.execute {
         try {
-            http.newCall(authed("/api/networks").build()).execute().use { res ->
+            rest.newCall(authed("/api/networks").build()).execute().use { res ->
                 if (!res.isSuccessful) {
                     post { networksError = "Failed to load networks (HTTP ${res.code})" }
                     return@execute
@@ -2754,7 +2832,7 @@ open class LurkerClient {
             } else {
                 authed("/api/networks/$id").patch(body)
             }.build()
-            http.newCall(req).execute().use { res ->
+            rest.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) {
                     val err = runCatching {
                         JSONObject(res.body?.string().orEmpty()).optString("error")
@@ -2776,7 +2854,7 @@ open class LurkerClient {
 
     open fun deleteNetwork(id: Int, onDone: (String?) -> Unit) = io.execute {
         try {
-            http.newCall(authed("/api/networks/$id").delete().build()).execute().use { res ->
+            rest.newCall(authed("/api/networks/$id").delete().build()).execute().use { res ->
                 if (!res.isSuccessful) {
                     post { onDone("delete failed (HTTP ${res.code})") }
                     return@execute
@@ -2796,7 +2874,7 @@ open class LurkerClient {
     /** connect | disconnect | reconnect. Live state lands via the WS snapshot. */
     open fun networkAction(id: Int, action: String) = io.execute {
         try {
-            http.newCall(
+            rest.newCall(
                 authed("/api/networks/$id/$action").post(ByteArray(0).toRequestBody(null)).build(),
             ).execute().use { res ->
                 if (!res.isSuccessful) {
@@ -2812,7 +2890,7 @@ open class LurkerClient {
 
     fun loadDcc() = io.execute {
         try {
-            http.newCall(authed("/api/dcc?limit=100").build()).execute().use { res ->
+            rest.newCall(authed("/api/dcc?limit=100").build()).execute().use { res ->
                 if (res.code == 403) {
                     post { dccEnabled = false; dccError = null }
                     return@execute
@@ -2825,7 +2903,7 @@ open class LurkerClient {
                 post {
                     dccEnabled = true
                     dccError = null
-                    if (arr != null) for (i in 0 until arr.length()) applyTransfer(arr.getJSONObject(i))
+                    if (arr != null) for (i in 0 until arr.length()) arr.optJSONObject(i)?.let(::applyTransfer)
                 }
             }
         } catch (e: Exception) {
@@ -2842,7 +2920,7 @@ open class LurkerClient {
             val req = authed("/api/dcc/$id/$action")
                 .post(ByteArray(0).toRequestBody(null))
                 .build()
-            http.newCall(req).execute().use { res ->
+            rest.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) {
                     post { dccError = "DCC $action failed (HTTP ${res.code})" }
                     return@execute
@@ -2868,7 +2946,7 @@ open class LurkerClient {
                 .addFormDataPart("nick", nick)
                 .addFormDataPart("file", filename, fileBody)
                 .build()
-            http.newCall(authed("/api/dcc/send").post(body).build()).execute().use { res ->
+            uploadHttp.newCall(authed("/api/dcc/send").post(body).build()).execute().use { res ->
                 val bodyText = res.body?.string().orEmpty()
                 if (!res.isSuccessful) {
                     val err = runCatching { JSONObject(bodyText).optString("error") }.getOrNull()
@@ -2910,7 +2988,7 @@ open class LurkerClient {
             val body = JSONObject().put("networkId", networkId).put("nick", nick)
                 .apply { if (open && passive) put("passive", true) }
                 .toString().toRequestBody(json)
-            http.newCall(authed(path).post(body).build()).execute().use { res ->
+            rest.newCall(authed(path).post(body).build()).execute().use { res ->
                 if (!res.isSuccessful) {
                     val err = runCatching {
                         JSONObject(res.body?.string().orEmpty()).optString("error")
@@ -2956,7 +3034,7 @@ open class LurkerClient {
                     val server = buffers.firstOrNull { it.networkId == networkId && it.isServerBuffer }
                     notificationSink?.invoke(
                         NotifiableEvent(
-                            networkId, server?.target ?: ":server:", from,
+                            networkId, server?.target ?: ":server:$networkId", from,
                             "wants to start a DCC chat", isDm = true,
                         ),
                     )
@@ -3034,7 +3112,7 @@ open class LurkerClient {
         io.execute {
             try {
                 val path = "/api/highlights?limit=50" + (before?.let { "&before=$it" } ?: "")
-                http.newCall(authed(path).build()).execute().use { res ->
+                rest.newCall(authed(path).build()).execute().use { res ->
                     if (!res.isSuccessful) {
                         post { highlightsLoading = false }
                         return@execute
@@ -3068,7 +3146,7 @@ open class LurkerClient {
         io.execute {
             try {
                 val path = "/api/bookmarks?limit=50" + (before?.let { "&before=$it" } ?: "")
-                http.newCall(authed(path).build()).execute().use { res ->
+                rest.newCall(authed(path).build()).execute().use { res ->
                     if (!res.isSuccessful) {
                         post { bookmarksLoading = false }
                         return@execute
@@ -3348,7 +3426,7 @@ open class LurkerClient {
 
     open fun loadSettings() = io.execute {
         try {
-            http.newCall(authed("/api/settings/bootstrap").build()).execute().use { res ->
+            rest.newCall(authed("/api/settings/bootstrap").build()).execute().use { res ->
                 if (!res.isSuccessful) {
                     post { settingsError = "Settings unavailable (HTTP ${res.code})"; settingsLoaded = true }
                     return@execute
@@ -3360,7 +3438,7 @@ open class LurkerClient {
                     settingsRegistry.clear()
                     settingsValues.clear()
                     if (reg != null) for (i in 0 until reg.length()) {
-                        parseOption(reg.getJSONObject(i))?.let(settingsRegistry::add)
+                        reg.optJSONObject(i)?.let(::parseOption)?.let(settingsRegistry::add)
                     }
                     if (vals != null) for (k in vals.keys()) {
                         settingsValues[k] = jsonToValue(vals.get(k))
@@ -3379,7 +3457,7 @@ open class LurkerClient {
             val changes = JSONObject().put(key, toJson(value))
             val body = JSONObject().put("changes", changes).toString().toRequestBody(json)
             val req = authed("/api/settings/").patch(body).build()
-            http.newCall(req).execute().use { res ->
+            rest.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) {
                     post { settingsError = "Couldn't save $key (HTTP ${res.code})" }
                     return@execute
@@ -3393,7 +3471,7 @@ open class LurkerClient {
 
     fun resetSetting(key: String) = io.execute {
         try {
-            http.newCall(authed("/api/settings/$key").delete().build()).execute().use { res ->
+            rest.newCall(authed("/api/settings/$key").delete().build()).execute().use { res ->
                 if (res.isSuccessful) applyValues(res)
             }
         } catch (_: Exception) {
@@ -3470,6 +3548,10 @@ open class LurkerClient {
 
         /** A channel-joined within this of the join request focuses that channel. */
         const val JOIN_FOCUS_WINDOW_MS = 15_000L
+
+        /** A background buffer past this many lines is trimmed to [KEEP_BUFFER_MESSAGES]. */
+        const val MAX_BUFFER_MESSAGES = 1_500
+        const val KEEP_BUFFER_MESSAGES = 1_000
         val COUNTABLE = setOf("message", "action", "notice")
         val SYSTEM_TYPES = setOf("join", "part", "quit", "nick", "kick", "mode", "topic", "invite")
     }

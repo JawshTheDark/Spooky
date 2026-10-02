@@ -82,4 +82,11 @@ class OAuthTest {
         assertNull(OAuthPending.fromJson("{}"))
         assertNull(OAuthPending.fromJson("garbage"))
     }
+
+    @Test
+    fun aMalformedEscapeIsRejectedNotThrown() {
+        // The redirect activity is exported, so any app can send us this; it runs
+        // on a bare thread where a throw would kill the app.
+        assertNull(OAuth.parseRedirect("chat.irc.lurker:/oauth?code=%zz&state=ok", "chat.irc.lurker"))
+    }
 }

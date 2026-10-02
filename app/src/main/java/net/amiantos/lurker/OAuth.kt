@@ -84,7 +84,11 @@ object OAuth {
             if (pair.isEmpty()) continue
             val k = pair.substringBefore('=')
             val v = pair.substringAfter('=', "")
-            q[URLDecoder.decode(k, "UTF-8")] = URLDecoder.decode(v, "UTF-8")
+            // Belt and braces: URI() above already rejects a malformed `%` escape,
+            // but this runs on a bare thread, where a throw would take the app down.
+            val dk = runCatching { URLDecoder.decode(k, "UTF-8") }.getOrNull() ?: continue
+            val dv = runCatching { URLDecoder.decode(v, "UTF-8") }.getOrNull() ?: continue
+            q[dk] = dv
         }
         return Redirect(code = q["code"], error = q["error"], state = q["state"])
     }

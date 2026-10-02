@@ -25,9 +25,10 @@ class LurkerApp : Application(), ImageLoaderFactory {
     // Lurker-server mode (default) or direct-IRC/bouncer mode, chosen by the
     // persisted clientMode. Lazy, so the mode must be set before first access —
     // the first-run ModePicker sets it (Phase 4). Switching modes = app restart.
-    val client: LurkerClient by lazy {
+    private val clientDelegate = lazy {
         if (Prefs(this).clientMode == "direct") DirectIrcBackend(this) else LurkerClient()
     }
+    val client: LurkerClient by clientDelegate
 
     // Biometric-lock state kept here (not in the Activity) so it survives Activity
     // recreation — rotating the screen shouldn't re-prompt. backgroundedAt lets
@@ -39,6 +40,12 @@ class LurkerApp : Application(), ImageLoaderFactory {
         super.onCreate()
         // Diagnostics + crash trap, first thing so it captures early failures.
         DebugLog.init(this)
+        // Process-scoped like the client, so it keeps working while only the
+        // background service is alive. Never creates the client itself: before a
+        // mode is chosen there's nothing to reconnect.
+        NetworkMonitor(this) { switched ->
+            if (clientDelegate.isInitialized()) client.onNetworkAvailable(switched)
+        }.start()
     }
 
     override fun newImageLoader(): ImageLoader =

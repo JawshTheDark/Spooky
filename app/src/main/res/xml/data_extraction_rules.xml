@@ -1,19 +1,16 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
--->
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ backup rules. The direct-mode network store is encrypted with a
+     Keystore key that never leaves this device, so a restored copy can't be
+     decrypted: the store then failed to open and the app silently fell back to
+     PLAINTEXT prefs for any networks saved afterwards. Leave both files (the data
+     and its Tink keyset) out of backups; a restore starts with a fresh store. -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="lurker_direct_enc.xml" />
+        <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs__.xml" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="lurker_direct_enc.xml" />
+        <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs__.xml" />
     </device-transfer>
-    -->
 </data-extraction-rules>

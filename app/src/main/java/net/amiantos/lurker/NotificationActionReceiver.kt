@@ -25,6 +25,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
         val target = intent.getStringExtra(Notifier.EXTRA_TARGET)
         if (networkId < 0 || target.isNullOrEmpty()) return
         val client = (context.applicationContext as? LurkerApp)?.client ?: return
+        // On a cold start the client was never started (no Activity ran), so it
+        // has no socket: a reply would vanish, and mark-read/mute would no-op.
         val nm = NotificationManagerCompat.from(context)
         val notifId = "$networkId::$target".hashCode()
 
@@ -32,11 +34,19 @@ class NotificationActionReceiver : BroadcastReceiver() {
             Notifier.ACTION_REPLY -> {
                 val text = RemoteInput.getResultsFromIntent(intent)
                     ?.getCharSequence(Notifier.KEY_REPLY)?.toString()?.trim()
-                if (!text.isNullOrEmpty()) {
+                if (text.isNullOrEmpty()) {
+                    nm.cancel(notifId)
+                } else if (!client.connected) {
+                    // Not connected (the app was closed, or the link is down): the
+                    // reply has nowhere to go. It used to vanish silently — keep it
+                    // in front of the user instead.
+                    DebugLog.w("notif", "reply to $target not sent: not connected")
+                    Notifier.postReplyFailed(context, networkId, target, text)
+                } else {
                     client.replyFromNotification(networkId, target, text)
                     DebugLog.i("notif", "reply sent to $target")
+                    nm.cancel(notifId)
                 }
-                nm.cancel(notifId)
             }
             Notifier.ACTION_MARK_READ -> {
                 client.markReadFromNotification(networkId, target)

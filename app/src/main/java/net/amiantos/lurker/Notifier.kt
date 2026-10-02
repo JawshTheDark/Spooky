@@ -60,6 +60,36 @@ object Notifier {
         )
     }
 
+    /** Replace a conversation's notification with "your reply didn't send", keeping
+     *  the text so it isn't lost. Tapping opens the conversation. */
+    fun postReplyFailed(context: Context, networkId: Int, target: String, text: String) {
+        val nm = NotificationManagerCompat.from(context)
+        if (!nm.areNotificationsEnabled()) return
+        ensureChannels(context)
+        val tap = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_NETWORK_ID, networkId)
+            putExtra(EXTRA_TARGET, target)
+        }
+        val pi = PendingIntent.getActivity(
+            context, "$networkId::$target".hashCode(), tap,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notif = NotificationCompat.Builder(context, CHANNEL_DMS)
+            .setSmallIcon(R.drawable.ic_stat_notification)
+            .setContentTitle("Reply not sent — not connected")
+            .setContentText("“${text.take(120)}” — open the app to send it.")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("“$text”\n\nOpen the app to send it."))
+            .setAutoCancel(true)
+            .setSilent(true)
+            .setContentIntent(pi)
+            .build()
+        try {
+            nm.notify("$networkId::$target".hashCode(), notif)
+        } catch (_: SecurityException) {
+        }
+    }
+
     fun post(context: Context, e: NotifiableEvent) {
         val nm = NotificationManagerCompat.from(context)
         if (!nm.areNotificationsEnabled()) return

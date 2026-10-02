@@ -3,9 +3,11 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- NetworkMonitor: reconnect as soon as the network changes or comes back. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <!-- Voice/video calls (lurker#680). Camera + a matching FGS type are optional:
          audio-only calls work without them. -->
@@ -74,10 +76,18 @@
         <!-- Opt-in background liveness anchor (Prefs.backgroundConnect). Holds no
              socket of its own; keeps the process alive so the shared client's
              WebSocket stays connected for background notifications. -->
+        <!-- specialUse, not dataSync: Android 15+ caps dataSync at 6 hours a day,
+             after which the OS stopped this anchor and the connection died
+             overnight. HexDroid (also on Play) uses specialUse for the same job.
+             Play Console asks for this justification at upload. -->
         <service
             android:name=".LurkerConnectionService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the user's IRC chat connection open in the background when they turn on Stay connected, so highlights and direct messages arrive in real time. IRC has no push service; shows an ongoing notification with a Stop action." />
+        </service>
 
         <!-- Holds an active voice/video call in the foreground so the OS keeps the
              mic/camera capture alive while the app is backgrounded (lurker#680). -->

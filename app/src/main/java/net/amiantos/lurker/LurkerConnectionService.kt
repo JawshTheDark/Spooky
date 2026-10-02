@@ -60,19 +60,17 @@ class LurkerConnectionService : Service() {
             .build()
         try {
             if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             } else {
                 startForeground(NOTIF_ID, notif)
             }
         } catch (e: Exception) {
-            // Android 15+ caps a dataSync foreground service at ~6h per 24h. Once
-            // that budget is spent, startForeground throws
-            // ForegroundServiceStartNotAllowedException — and the OS's own
-            // START_STICKY restarts kept walking straight back into it, so the app
-            // crash-looped overnight. Stop cleanly instead of crashing; the anchor
-            // simply isn't up this round and comes back on the next foreground,
-            // when the rolling budget has room again. START_NOT_STICKY so the OS
-            // doesn't immediately retry into the same wall.
+            // startForeground can still be refused — most often when the OS
+            // restarts us (START_STICKY) from the background, which needs an
+            // exemption we may not have. (It was also how the old dataSync type's
+            // 6h/day cap surfaced, and the restarts crash-looped into it.) Stop
+            // cleanly instead of crashing; the anchor comes back on the next
+            // foreground. START_NOT_STICKY so the OS doesn't retry into the same wall.
             DebugLog.e("service", "startForeground refused (${e.javaClass.simpleName}); standing down")
             stopSelf()
             return START_NOT_STICKY
@@ -83,14 +81,12 @@ class LurkerConnectionService : Service() {
     }
 
     /**
-     * Android 15+ dataSync time limit reached (API 35+). The OS gives us a few
-     * seconds to stop before it force-crashes us with
-     * ForegroundServiceDidNotStopInTimeException — which is exactly what it was
-     * doing. Stand down gracefully; background notifications resume the next time
-     * the app is foregrounded and the daily budget has refreshed.
+     * An Android 15+ foreground-service time limit was reached. specialUse has no
+     * such limit, so this shouldn't fire any more; kept so a future type change
+     * can't bring back ForegroundServiceDidNotStopInTimeException crashes.
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
-        DebugLog.w("service", "dataSync time limit reached; stopping before the OS kills us")
+        DebugLog.w("service", "foreground time limit reached; stopping before the OS kills us")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

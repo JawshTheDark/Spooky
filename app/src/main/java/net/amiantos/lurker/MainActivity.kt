@@ -406,7 +406,7 @@ class MainActivity : FragmentActivity() {
         consumeOAuthIntent(intent)
         // Opt-in always-on: revive the liveness anchor on launch (from the
         // foreground, so the background-start rule never bites).
-        if (prefs.backgroundConnect && prefs.hasSession) LurkerConnectionService.start(this)
+        if (wantsBackgroundConnection()) LurkerConnectionService.start(this)
         setContent {
             LurkerTheme {
                 // Hoisted above the lock gate: a relock returns early before this
@@ -703,7 +703,7 @@ class MainActivity : FragmentActivity() {
         if (intent.action != Intent.ACTION_VIEW || !data.scheme.equals(packageName, ignoreCase = true)) return
         intent.data = null // consume so a config change doesn't replay (and re-spend) the code
         val uri = data.toString()
-        Thread { client.completeOAuth(uri) }.start()
+        Thread { runCatching { client.completeOAuth(uri) } }.start()
     }
 
     /** Relaunch the app in a fresh process so LurkerApp re-creates its lazy
@@ -720,11 +720,22 @@ class MainActivity : FragmentActivity() {
         intent.removeExtra(Notifier.EXTRA_MESSAGE_ID)
     }
 
+    /**
+     * The share target is exported, and the upload path reads whatever URI it's
+     * handed WITH THIS APP'S PERMISSIONS. A `file://` URI — or one on our own
+     * FileProvider — let any app make Spooky upload its own private files (the
+     * session token's prefs file included) to the user's upload host and paste
+     * the public link into the composer. Accept only another app's content URI.
+     */
+    private fun isShareableUri(uri: Uri): Boolean =
+        uri.scheme.equals("content", ignoreCase = true) &&
+            uri.authority?.startsWith(packageName) != true
+
     private fun consumeShareIntent(intent: Intent?) {
         if (intent?.action == Intent.ACTION_SEND) {
             @Suppress("DEPRECATION")
             val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
-            if (uri != null) sharedUri = uri
+            if (uri != null && isShareableUri(uri)) sharedUri = uri
             intent.action = null // consume so a config change doesn't replay it
         }
     }
@@ -739,7 +750,7 @@ class MainActivity : FragmentActivity() {
         // resuming a still-alive Activity wouldn't otherwise restart it. Safe to
         // call when it's already running (idempotent) or still out of budget (the
         // service catches the refused start and stands down without crashing).
-        if (prefs.backgroundConnect && prefs.hasSession) LurkerConnectionService.start(this)
+        if (wantsBackgroundConnection()) LurkerConnectionService.start(this)
         // Re-lock only after a real trip away (>2s), so a rotation/layout switch
         // doesn't re-prompt. First launch: backgroundedAt is 0 → treated as away.
         if (prefs.biometricLock) {
@@ -854,6 +865,12 @@ class MainActivity : FragmentActivity() {
             unlock() // no usable authenticator — don't trap the user out
         }
     }
+
+    /** "Stay connected" is on and there's something to stay connected TO. Direct
+     *  mode has no Lurker session token — gating on `hasSession` alone meant the
+     *  anchor was never revived there after a restart, only by the toggle itself. */
+    private fun wantsBackgroundConnection(): Boolean =
+        prefs.backgroundConnect && (prefs.hasSession || prefs.clientMode == "direct")
 
     private fun unlock() {
         (application as LurkerApp).unlocked = true
@@ -3592,6 +3609,9 @@ private fun readUpload(
     context: android.content.Context,
     uri: android.net.Uri,
 ): Pair<String, RequestBody>? {
+    // Content URIs only (pickers, the camera's FileProvider, the share sheet).
+    // A file:// path would be read with this app's own permissions.
+    if (!uri.scheme.equals("content", ignoreCase = true)) return null
     return try {
         var name = "file"
         var size = -1L
@@ -5803,12 +5823,19 @@ private fun HighlightColorCard(prefs: Prefs) {
 
 /** A titled on-device toggle row, matching the InlineMedia/theme cards. */
 @Composable
-private fun PrefToggleCard(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun PrefToggleCard(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onClick: (() -> Unit)? = null,
+    onChange: (Boolean) -> Unit,
+) {
     Surface(
         color = SurfaceDark,
         shape = RoundedCornerShape(12.dp),
         border = BorderStroke(0.5.dp, GlassBorder),
-        modifier = Modifier.fillMaxWidth().padding(16.dp, 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(16.dp, 4.dp)
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
     ) {
         Row(
             Modifier.fillMaxWidth().padding(16.dp, 12.dp),
@@ -5975,14 +6002,63 @@ private fun ChatTextSizeCard(prefs: Prefs) {
 private fun BackgroundConnectCard(prefs: Prefs) {
     val context = LocalContext.current
     var on by remember { mutableStateOf(prefs.backgroundConnect) }
+    // Re-checked on every resume: the user comes back from the system settings.
+    val power = remember { context.getSystemService(android.os.PowerManager::class.java) }
+    var exempt by remember { mutableStateOf(true) }
+    LifecycleResumeEffect(Unit) {
+        exempt = power?.isIgnoringBatteryOptimizations(context.packageName) != false
+        onPauseOrDispose { }
+    }
+    var showBatteryHelp by remember { mutableStateOf(false) }
     PrefToggleCard(
         title = "Stay connected in background",
-        subtitle = "Keep a persistent notification so highlights & DMs notify you even when the app is closed.",
+        subtitle = "Keep a persistent notification so highlights & DMs notify you even when the app is closed." +
+            if (on && !exempt) "\n⚠ Battery optimisation is on for this app — tap here to fix." else "",
         checked = on,
+        onClick = if (on && !exempt) ({ showBatteryHelp = true }) else null,
     ) {
         on = it
         prefs.backgroundConnect = it
         if (it) LurkerConnectionService.start(context) else LurkerConnectionService.stop(context)
+        // The service keeps the process alive, but battery optimisation (and OEM
+        // battery managers on top of it) still kill or freeze it overnight. Every
+        // Android IRC client that stays connected asks for the exemption; send the
+        // user to the system list rather than requesting it directly (Play-safe).
+        if (it && !exempt) showBatteryHelp = true
+    }
+    if (showBatteryHelp) {
+        AlertDialog(
+            onDismissRequest = { showBatteryHelp = false },
+            containerColor = SurfaceRaised,
+            title = { Text("Stay connected overnight", color = TextPrimary) },
+            text = {
+                Text(
+                    "Android's battery optimisation can still close the connection while your phone sleeps. " +
+                        "To stay connected reliably, set this app to \"Unrestricted\" (or \"Not optimised\") in the " +
+                        "battery settings. Some phones (Samsung, Xiaomi, OnePlus) also need background activity " +
+                        "allowed in their own battery manager.",
+                    color = TextSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBatteryHelp = false
+                    runCatching {
+                        context.startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    }.onFailure {
+                        runCatching {
+                            context.startActivity(
+                                Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                                    .setData(Uri.parse("package:${context.packageName}")),
+                            )
+                        }
+                    }
+                }) { Text("Open battery settings", color = AccentBlue, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatteryHelp = false }) { Text("Not now", color = TextSecondary) }
+            },
+        )
     }
 }
 

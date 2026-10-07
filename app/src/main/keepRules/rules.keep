@@ -1,12 +1,45 @@
-# Add project specific R8 rules here.
-# AGP will combine all keep rule files in src/main/keepRules to pass to R8
+# R8 keep rules (AGP combines every file in src/main/keepRules).
 #
-# For more details, see
-#   https://d.android.com/r/tools/r8/keep-rules
+# Release builds are shrunk and obfuscated — Play flags an app whose DEX is
+# under 25% obfuscated. Everything below exists because something finds code
+# by NAME at runtime, which renaming would break.
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# ---- Direct-IRC engine ---------------------------------------------------------
+# KICL wires itself with reflection, and MBassador (its event bus) finds
+# @Handler methods — KICL's own listeners and DirectIrcBackend's — reflectively
+# and dispatches by parameter type. Kept whole; it's a small library.
+-keep class org.kitteh.irc.client.library.** { *; }
+-keep class net.engio.mbassy.** { *; }
+-keepclassmembers class * {
+    @net.engio.mbassy.listener.Handler <methods>;
+}
+# Netty creates channels and allocators reflectively and probes JDK internals.
+-keep class io.netty.** { *; }
+
+# ---- Our own code ----------------------------------------------------------------
+# Enums read back by name (DebugLog.Level.valueOf on the persisted log).
+-keepclassmembers enum net.amiantos.lurker.** {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+
+# Netty references optional integrations it probes for at runtime and that an
+# Android app never ships: native TLS (tcnative), compression codecs, protobuf
+# codecs, server-side loggers, GraalVM substitutions, JDK-internal security.
+-dontwarn io.netty.internal.tcnative.**
+-dontwarn com.aayushatharva.brotli4j.**
+-dontwarn com.github.luben.zstd.**
+-dontwarn com.google.protobuf.**
+-dontwarn com.jcraft.jzlib.**
+-dontwarn com.ning.compress.**
+-dontwarn com.oracle.svm.**
+-dontwarn javax.el.**
+-dontwarn lzma.sdk.**
+-dontwarn net.jpountz.**
+-dontwarn org.apache.log4j.**
+-dontwarn org.apache.logging.log4j.**
+-dontwarn org.eclipse.jetty.**
+-dontwarn org.jboss.marshalling.**
+-dontwarn org.slf4j.**
+-dontwarn reactor.blockhound.**
+-dontwarn sun.security.**

@@ -26,8 +26,8 @@ android {
         // the mainline API level — a Boox Palma is API 33. Nothing here needs 34.
         minSdk = 31
         targetSdk = 36
-        versionCode = 126
-        versionName = "0.11.1"
+        versionCode = 127
+        versionName = "0.11.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -68,8 +68,11 @@ android {
 
     buildTypes {
         release {
+            // R8: shrink + obfuscate. Play flags an app under 25% obfuscated
+            // (it was 1% with this off), and the APK gets much smaller. Keep
+            // rules for the reflection-driven libraries: src/main/keepRules.
             optimization {
-                enable = false
+                enable = true
             }
             // Only the spooky flavor's release ships to Play; debug fallback keeps
             // fresh clones building.

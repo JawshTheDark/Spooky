@@ -538,6 +538,12 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
                     post { buffers.removeAll { it.key == buffer.key }; messagesByBuffer.remove(buffer.key) }
                 }
                 "clear" -> post { messagesByBuffer[buffer.key] = emptyList() }
+                // /away: this network, or every connected one with -all.
+                "away" -> {
+                    val line = if (op.text.isNullOrBlank()) "AWAY" else "AWAY :${ircLines(op.text).joinToString(" ")}"
+                    val targets = if (op.all == true) manager.entries().map { it.second } else listOf(client)
+                    for (c in targets) guarded { c.sendRawLine(line) }
+                }
                 "e2e" -> localNotice(buffer, "End-to-end encryption isn't available in direct IRC mode.")
             }
         }

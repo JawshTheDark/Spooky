@@ -2163,11 +2163,35 @@ private fun ChatScreen(
     LaunchedEffect(stillOpen) { if (!stillOpen && client.buffers.isNotEmpty()) onBack() }
     // Prefix the composer with "nick: " — the shared reply seam for the
     // long-press action sheet and the swipe-to-reply gesture.
-    fun replyTo(m: Msg) {
+    fun addressNick(m: Msg) {
         // "nick, " — the same ping form nick-completion uses at line start, not ":".
         val t = "${m.nick}, " + draft.text
         draft = TextFieldValue(t, TextRange(t.length))
         client.setDraftLocal(buffer, t)
+    }
+    // Reply: an IRCv3 reply when the server can name the line (Lurker 2.4+ and a
+    // msgid), shown quoted above the sent message; otherwise the plain address.
+    // The quote carries the context, so a DM needs no "nick, " — a channel still
+    // gets one so the line reads as addressed to them.
+    fun replyTo(m: Msg) {
+        if (!client.canReplyTo(buffer, m)) { addressNick(m); return }
+        val addressed = buffer.isChannel && !m.self && !draft.text.startsWith("${m.nick}, ")
+        if (addressed) addressNick(m)
+        client.setDraftReply(
+            buffer,
+            DraftReply(m.id, addressed, ReplyParent(m.id, m.nick, m.type, m.text.take(300), m.self)),
+        )
+    }
+    // Cancelling also takes back the "nick, " the reply put in, if it's still there.
+    fun cancelReply() {
+        val r = client.draftReplies[buffer.key] ?: return
+        val prefix = r.parent?.nick?.let { "$it, " }
+        if (r.addressed && prefix != null && draft.text.startsWith(prefix)) {
+            val t = draft.text.removePrefix(prefix)
+            draft = TextFieldValue(t, TextRange(t.length))
+            client.setDraftLocal(buffer, t)
+        }
+        client.setDraftReply(buffer, null)
     }
     var showMembers by remember { mutableStateOf(false) }
     var showE2e by remember { mutableStateOf(false) }
@@ -2250,7 +2274,7 @@ private fun ChatScreen(
         onDispose { context.findActivity()?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
     }
     fun uploadIntoDraft(uri: Uri) {
-        val upload = readUpload(context, uri)
+        val upload = readUpload(context, uri, shrinkToPx = client.maxStaticImageDimension)
         if (upload == null) {
             client.localNotice(buffer, "Couldn't read that file.")
             return
@@ -2482,6 +2506,22 @@ private fun ChatScreen(
             listState.scrollToItem((rows.lastIndex + headerCount).coerceAtLeast(0))
         }
     }
+    // Tap a reply's quote: go to the line it answers, and flash it.
+    fun jumpTo(id: Long) {
+        val idx = rows.indexOfFirst { rowMsgId(it) == id }
+        if (idx < 0) {
+            android.widget.Toast.makeText(context, "That message isn't loaded — try Load older.", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        pinnedToTail = false
+        chatScope.launch { listState.animateScrollToItem(idx + headerCount) }
+        flashMsgId = id
+    }
+    // A line's reaction chips, and whether tapping one can send a reaction.
+    fun reactionsOf(m: Msg): List<ReactionGroup> =
+        if (m.id > 0 && buffer.networkId != null) groupReactions(client.reactions[m.id]) else emptyList()
+    fun reactOn(m: Msg): ((String) -> Unit)? =
+        if (client.canReact(buffer, m)) { v: String -> client.react(m.id, v) } else null
     /**
      * Actually put the composer contents on the wire. Split out of the send
      * lambda so the outgoing-translation cycle can reach it: an already-in-
@@ -2495,7 +2535,18 @@ private fun ChatScreen(
         val text = Commands.expandAlias(raw, client.aliases, myNick, buffer.target)
         when (val parsed = Commands.parse(text, buffer.target, buffer.networkId != null)) {
             is ParsedInput.Ops -> {
-                client.execute(buffer, parsed.ops)
+                // The reply rides the first line going to THIS buffer; a command
+                // that sends nothing here (/join, /whois…) leaves it in place.
+                val reply = client.draftReplies[buffer.key]
+                var usedReply = false
+                val ops = if (reply == null) parsed.ops else parsed.ops.map { op ->
+                    if (!usedReply && op.target == null && (op.type == "send" || op.type == "action")) {
+                        usedReply = true
+                        op.copy(replyTo = reply.messageId)
+                    } else op
+                }
+                if (usedReply) client.consumeDraftReply(buffer)
+                client.execute(buffer, ops)
                 parsed.openTarget?.let { target ->
                     buffer.networkId?.let { onOpenBuffer(client.focusTarget(it, target)) }
                 }
@@ -2680,8 +2731,12 @@ private fun ChatScreen(
                             onAction = { actionMsg = it },
                             onMediaLoaded = { mediaTick++ },
                             flash = row.msg.id == flashMsgId,
-                            onNickTap = { replyTo(row.msg) },
+                            // The nick tap stays the quick "nick, " address.
+                            onNickTap = { addressNick(row.msg) },
                             onChannel = chanTap,
+                            reactions = reactionsOf(row.msg),
+                            onReact = reactOn(row.msg),
+                            onJumpTo = ::jumpTo,
                         )
                     } else MessageBubble(
                         row.msg, row.first, row.last, baseSize, openLink,
@@ -2691,6 +2746,9 @@ private fun ChatScreen(
                         onSwipeReply = { replyTo(it) },
                         onChannel = chanTap,
                         flash = row.msg.id == flashMsgId,
+                        reactions = reactionsOf(row.msg),
+                        onReact = reactOn(row.msg),
+                        onJumpTo = ::jumpTo,
                         revealProvider = { revealAnim.value },
                         revealMaxPx = revealMaxPx,
                         onReveal = { d ->
@@ -2700,7 +2758,13 @@ private fun ChatScreen(
                         },
                         onRevealEnd = { revealScope.launch { revealAnim.animateTo(0f) } },
                     )
-                    is ChatRow.Action -> if (Ui.compact) CompactActionRow(row.msg, baseSize, openLink) else ActionLine(row.msg, baseSize, openLink)
+                    is ChatRow.Action -> Column {
+                        if (Ui.compact) CompactActionRow(row.msg, baseSize, openLink) else ActionLine(row.msg, baseSize, openLink)
+                        ReactionChips(
+                            reactionsOf(row.msg), reactOn(row.msg), alignEnd = false,
+                            modifier = Modifier.padding(start = 12.dp, bottom = 2.dp),
+                        )
+                    }
                     is ChatRow.SystemLine -> {
                         // An undelivered message gets its text back plus Resend /
                         // Discard, instead of a dead-end notice.
@@ -2894,6 +2958,7 @@ private fun ChatScreen(
                 // Completion: the word under the cursor drives a suggestion strip —
                 // nicks in channels, /commands at line start. No Tab key on mobile.
                 val word = Completion.wordAt(draft.text, draft.selection.start)
+                val replying = client.draftReplies[buffer.key]
                 val suggestions = remember(
                     draft.text, draft.selection.start,
                     client.members[buffer.key], client.buffers.size, client.chanlistRows.size,
@@ -2959,9 +3024,10 @@ private fun ChatScreen(
                             dispatchSend(raw)
                         }
                     },
-                    banner = if (translating || translateOriginal != null) {
+                    banner = if (translating || translateOriginal != null || replying != null) {
                         {
-                            Row(
+                            replying?.let { ReplyComposeBanner(it, onCancel = { cancelReply() }) }
+                            if (translating || translateOriginal != null) Row(
                                 Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
@@ -3118,6 +3184,8 @@ private fun ChatScreen(
         MessageActions(
             msg = m,
             client = client,
+            onReact = reactOn(m)?.let { send -> { v: String -> send(v); actionMsg = null } },
+            myReactions = client.reactions[m.id].orEmpty().filter { it.self }.map { it.value }.toSet(),
             onReply = {
                 replyTo(m)
                 actionMsg = null
@@ -3245,7 +3313,7 @@ private fun MemberSheet(
     ) {
         val roster = remember(client.members[buffer.key]) {
             (client.members[buffer.key] ?: emptyList())
-                .sortedWith(compareBy({ it.rank }, { it.nick.lowercase() }))
+                .sortedWith(compareBy({ it.rankFor(client.serverInfo[buffer.networkId ?: -1]?.prefixes) }, { it.nick.lowercase() }))
         }
         val sel = selected
         if (sel == null) {
@@ -3265,7 +3333,7 @@ private fun MemberSheet(
                     modifier = Modifier.fillMaxWidth().padding(24.dp),
                 )
             }
-            RosterList(roster, Modifier.heightIn(max = 460.dp)) { selected = it }
+            RosterList(roster, Modifier.heightIn(max = 460.dp), client.serverInfo[buffer.networkId ?: -1]?.prefixes) { selected = it }
         } else {
             MemberActions(
                 client = client,
@@ -3287,6 +3355,8 @@ private fun MemberSheet(
 private fun RosterList(
     roster: List<Member>,
     modifier: Modifier = Modifier,
+    /** The network's PREFIX ladder, when it advertised one. */
+    ladder: List<Pair<Char, Char>>? = null,
     onSelect: (Member) -> Unit,
 ) {
     LazyColumn(modifier) {
@@ -3300,7 +3370,7 @@ private fun RosterList(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    m.prefix.ifEmpty { " " },
+                    m.prefixFor(ladder).ifEmpty { " " },
                     // widthIn, not width: a two-symbol prefix ("@+") in a hard 20dp
                     // box wraps one symbol per line at a large font scale.
                     maxLines = 1,
@@ -3335,7 +3405,7 @@ private fun MemberPane(
     var selected by remember(buffer.key) { mutableStateOf<Member?>(null) }
     val roster = remember(client.members[buffer.key]) {
         (client.members[buffer.key] ?: emptyList())
-            .sortedWith(compareBy({ it.rank }, { it.nick.lowercase() }))
+            .sortedWith(compareBy({ it.rankFor(client.serverInfo[buffer.networkId ?: -1]?.prefixes) }, { it.nick.lowercase() }))
     }
     Column(
         Modifier.fillMaxSize()
@@ -3360,7 +3430,7 @@ private fun MemberPane(
                     modifier = Modifier.fillMaxWidth().padding(22.dp),
                 )
             }
-            RosterList(roster, Modifier.fillMaxSize()) { selected = it }
+            RosterList(roster, Modifier.fillMaxSize(), client.serverInfo[buffer.networkId ?: -1]?.prefixes) { selected = it }
         } else {
             MemberActions(
                 client = client,
@@ -3421,7 +3491,7 @@ private fun MemberActions(
         ) {
             TextButton(onClick = onBack) { Text("‹", color = AccentBlue, fontSize = 22.sp) }
             Text(
-                "${member.prefix}$nick",
+                "${member.prefixFor(client.serverInfo[networkId]?.prefixes)}$nick",
                 color = nickColor(nick),
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 17.sp,
@@ -3536,9 +3606,13 @@ private fun MessageActions(
     // Null on the :system: buffer, where there's no network to ask.
     onWhois: (() -> Unit)? = null,
     onDismiss: () -> Unit,
+    // IRCv3 reactions (Lurker 2.4+); null where this line can't take one.
+    onReact: ((String) -> Unit)? = null,
+    myReactions: Set<String> = emptySet(),
 ) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
+    var customReaction by remember { mutableStateOf<String?>(null) }
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -3552,6 +3626,55 @@ private fun MessageActions(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 26.dp, vertical = 6.dp),
         )
         HorizontalDivider(color = SurfaceRaised, modifier = Modifier.padding(vertical = 4.dp))
+        if (onReact != null) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                QUICK_REACTIONS.forEach { e ->
+                    val mine = e in myReactions
+                    Text(
+                        e,
+                        fontSize = 24.sp,
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(if (mine) AccentBlue.copy(alpha = 0.35f) else Color.Transparent, CircleShape)
+                            .clickable { onReact(e) }
+                            .padding(7.dp),
+                    )
+                }
+                Text(
+                    "＋",
+                    fontSize = 22.sp,
+                    color = AccentBlue,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { customReaction = if (customReaction == null) "" else null }
+                        .padding(7.dp),
+                )
+            }
+            // Any short text works too — IRCv3 reactions aren't limited to emoji.
+            customReaction?.let { cur ->
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = cur,
+                        onValueChange = { customReaction = it.replace("\n", "") },
+                        placeholder = { Text("React with anything…", fontSize = 14.sp) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { onReact(cur.trim()) },
+                        enabled = isValidReaction(cur.trim()),
+                    ) { Text("React", color = AccentBlue, fontWeight = FontWeight.SemiBold) }
+                }
+            }
+            HorizontalDivider(color = SurfaceRaised, modifier = Modifier.padding(vertical = 4.dp))
+        }
         SheetAction("Copy text") {
             clipboard.setText(AnnotatedString(msg.text))
             onDismiss()
@@ -3608,10 +3731,17 @@ internal fun uploadTooLarge(sizeBytes: Long, maxUploadBytes: Long): String? {
 private fun readUpload(
     context: android.content.Context,
     uri: android.net.Uri,
+    /** The server's maxStaticImageDimension (Lurker 2.4+), or 0 to send as-is.
+     *  Only for chat uploads — never a DCC send, which must arrive byte-exact. */
+    shrinkToPx: Int = 0,
 ): Pair<String, RequestBody>? {
     // Content URIs only (pickers, the camera's FileProvider, the share sheet).
     // A file:// path would be read with this app's own permissions.
     if (!uri.scheme.equals("content", ignoreCase = true)) return null
+    if (shrinkToPx > 0) {
+        val mime = context.contentResolver.getType(uri).orEmpty().lowercase()
+        if (mime == "image/jpeg" || mime == "image/png") shrinkingUpload(context, uri, mime, shrinkToPx)?.let { return it }
+    }
     return try {
         var name = "file"
         var size = -1L
@@ -3640,6 +3770,87 @@ private fun readUpload(
     }
 }
 
+/**
+ * A chat upload of a static JPEG/PNG, shrunk on the way out to the longest edge
+ * the server keeps (`maxStaticImageDimension`). The server would downscale it
+ * anyway, so sending a 48 MP photo whole only burns mobile data. The work runs
+ * when OkHttp writes the body — on the upload thread, not the UI. Anything that
+ * already fits, an animated PNG, or an image that won't decode goes up as-is.
+ * Keeps the source format; the server's re-encode owns quality and metadata.
+ * Length unknown up front (-1), so the size pre-check is left to the server.
+ */
+private fun shrinkingUpload(
+    context: android.content.Context,
+    uri: android.net.Uri,
+    mime: String,
+    maxPx: Int,
+): Pair<String, RequestBody>? {
+    var name = "image"
+    context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+        if (c.moveToFirst()) {
+            val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (i >= 0) name = c.getString(i) ?: name
+        }
+    }
+    runCatching { context.contentResolver.openInputStream(uri)?.close() ?: return null }.getOrElse { return null }
+    val body = object : RequestBody() {
+        override fun contentType() = "application/octet-stream".toMediaType()
+        override fun contentLength() = -1L
+        override fun writeTo(sink: BufferedSink) {
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw java.io.IOException("content no longer readable: $uri")
+            sink.write(shrinkImage(bytes, mime, maxPx) ?: bytes)
+        }
+    }
+    return name to body
+}
+
+/** [bytes] re-encoded with its longest edge at [maxPx], or null to send the
+ *  original (already fits, animated, or undecodable). Pure enough to unit-test. */
+internal fun shrinkImage(bytes: ByteArray, mime: String, maxPx: Int): ByteArray? {
+    if (maxPx <= 0) return null
+    if (mime == "image/png" && isAnimatedPng(bytes)) return null
+    val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    val longest = maxOf(bounds.outWidth, bounds.outHeight)
+    if (longest <= 0 || longest <= maxPx) return null
+    return runCatching {
+        // ImageDecoder applies the EXIF orientation, which a plain re-encode would drop.
+        val bmp = android.graphics.ImageDecoder.decodeBitmap(
+            android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes)),
+        ) { decoder, info, _ ->
+            val w = info.size.width
+            val h = info.size.height
+            val scale = maxPx.toDouble() / maxOf(w, h)
+            if (scale < 1.0) {
+                decoder.setTargetSize(maxOf(1, (w * scale).roundToInt()), maxOf(1, (h * scale).roundToInt()))
+            }
+            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+        val out = java.io.ByteArrayOutputStream()
+        val format = if (mime == "image/png") android.graphics.Bitmap.CompressFormat.PNG else android.graphics.Bitmap.CompressFormat.JPEG
+        bmp.compress(format, 95, out)
+        bmp.recycle()
+        out.toByteArray()
+    }.getOrNull()
+}
+
+/** An APNG carries an `acTL` chunk before its first `IDAT`; resizing one would
+ *  flatten the animation to a single frame. */
+internal fun isAnimatedPng(bytes: ByteArray): Boolean {
+    fun at(i: Int, tag: String) = i + 4 <= bytes.size && (0 until 4).all { bytes[i + it] == tag[it].code.toByte() }
+    var i = 8 // after the PNG signature
+    while (i + 8 <= bytes.size) {
+        val len = ((bytes[i].toInt() and 0xFF) shl 24) or ((bytes[i + 1].toInt() and 0xFF) shl 16) or
+            ((bytes[i + 2].toInt() and 0xFF) shl 8) or (bytes[i + 3].toInt() and 0xFF)
+        if (at(i + 4, "acTL")) return true
+        if (at(i + 4, "IDAT")) return false
+        if (len < 0) return false
+        i += 12 + len
+    }
+    return false
+}
+
 @Composable
 private fun MessageBubble(
     msg: Msg,
@@ -3662,6 +3873,9 @@ private fun MessageBubble(
     revealMaxPx: Float = 0f,
     onReveal: (Float) -> Unit = {},
     onRevealEnd: () -> Unit = {},
+    reactions: List<ReactionGroup> = emptyList(),
+    onReact: ((String) -> Unit)? = null,
+    onJumpTo: ((Long) -> Unit)? = null,
 ) {
     val self = msg.self
     // Null unless this buffer has translation on and the row is worth translating
@@ -3779,6 +3993,10 @@ private fun MessageBubble(
                 }
             }
         }
+        // An IRCv3 reply: the line it answers, quoted above the bubble.
+        msg.replyTo?.let { r ->
+            ReplyQuote(r, baseSize, onJumpTo, Modifier.padding(horizontal = 6.dp).padding(bottom = 2.dp))
+        }
         // A message fully painted with one mIRC background becomes a bubble of
         // that color instead of colored stripes inside a gray bubble.
         val paintedBg = remember(msg.text) { Mirc.wholeMessageBg(msg.text)?.let { Color(it) } }
@@ -3873,6 +4091,7 @@ private fun MessageBubble(
             if (ServerPreviews.enabled) ServerPreviewCards(msg, onLink)
             else LinkPreviewCards(msg.text, onLink)
         }
+        ReactionChips(reactions, onReact, alignEnd = self, modifier = Modifier.padding(top = 3.dp))
             // Timestamps are hidden here and revealed by swiping left (iMessage
             // style) — see the reveal overlay + drag above. Keeps the timeline
             // dense (d3fc0n1) while per-message times stay one gesture away.
@@ -3895,6 +4114,9 @@ private fun CompactMessageRow(
     onChannel: ((String) -> Unit)? = null,
     /** Buffer key for live translation, or null to always show the original. */
     translateKey: String? = null,
+    reactions: List<ReactionGroup> = emptyList(),
+    onReact: ((String) -> Unit)? = null,
+    onJumpTo: ((Long) -> Unit)? = null,
 ) {
     val paintedBg = remember(msg.text) { Mirc.wholeMessageBg(msg.text)?.let { Color(it) } }
     val goldHighlight = !msg.self && paintedBg == null && (msg.matched || flash)
@@ -3943,6 +4165,7 @@ private fun CompactMessageRow(
             .then(if (onAction != null) Modifier.combinedClickable(onClick = {}, onLongClick = { onAction(msg) }) else Modifier)
             .padding(horizontal = 12.dp, vertical = (1.5f * Ui.densityScale).dp),
     ) {
+        msg.replyTo?.let { r -> ReplyQuote(r, baseSize, onJumpTo, Modifier.padding(bottom = 1.dp)) }
         Text(line, fontSize = baseSize.sp, lineHeight = (baseSize + 3).sp, color = TextPrimary, fontFamily = Ui.chatFont)
         // NOT when the server resolves previews: those same URLs come back as
         // `image`/`video` descriptors and render in the block below, so running
@@ -3965,6 +4188,101 @@ private fun CompactMessageRow(
             if (ServerPreviews.enabled) ServerPreviewCards(msg, onLink)
             else LinkPreviewCards(msg.text, onLink)
         }
+        ReactionChips(reactions, onReact, alignEnd = false, modifier = Modifier.padding(top = 2.dp, bottom = 1.dp))
+    }
+}
+
+/** The six one-tap reactions on a message's action sheet. */
+private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🎉")
+
+/**
+ * The line an IRCv3 reply answers, quoted small above it (Lurker 2.4+). Tap to
+ * jump there. When the server no longer holds it, says so rather than vanishing.
+ */
+@Composable
+private fun ReplyQuote(reply: ReplyRef, baseSize: Int, onJump: ((Long) -> Unit)?, modifier: Modifier = Modifier) {
+    val p = reply.parent
+    val text = remember(p) {
+        if (p == null) "↪ a message that's no longer here"
+        else "↪ ${p.nick}: " + Mirc.strip(p.text).replace('\n', ' ')
+    }
+    Text(
+        text,
+        color = TextSecondary,
+        fontSize = (baseSize - 3).sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(SurfaceRaised.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .then(if (p != null && onJump != null) Modifier.clickable { onJump(p.id) } else Modifier)
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    )
+}
+
+/**
+ * A line's IRCv3 reactions as chips: value + count, filled when one is yours.
+ * Tap toggles yours (when the line can take one); long-press shows who reacted.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ReactionChips(
+    groups: List<ReactionGroup>,
+    onToggle: ((String) -> Unit)?,
+    alignEnd: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (groups.isEmpty()) return
+    val context = LocalContext.current
+    FlowRow(
+        modifier,
+        horizontalArrangement = Arrangement.spacedBy(4.dp, if (alignEnd) Alignment.End else Alignment.Start),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        groups.forEach { g ->
+            val shape = RoundedCornerShape(10.dp)
+            Text(
+                if (g.nicks.size > 1) "${g.value} ${g.nicks.size}" else g.value,
+                color = if (g.mine) Color.White else TextPrimary,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    // A long text reaction mustn't widen the row (upstream #1020).
+                    .widthIn(max = 160.dp)
+                    .clip(shape)
+                    .background(if (g.mine) AccentBlue.copy(alpha = 0.85f) else SurfaceRaised, shape)
+                    .border(0.5.dp, GlassBorder, shape)
+                    .combinedClickable(
+                        onClick = { onToggle?.invoke(g.value) },
+                        onLongClick = {
+                            android.widget.Toast.makeText(
+                                context, "${g.value} — ${g.nicks.joinToString(", ")}", android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        },
+                    )
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+            )
+        }
+    }
+}
+
+/** Above the composer while a reply is being written: who to, and ✕ to cancel. */
+@Composable
+private fun ReplyComposeBanner(reply: DraftReply, onCancel: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp, top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            "↪ Replying to " + (reply.parent?.let { "${it.nick}: " + Mirc.strip(it.text).replace('\n', ' ') } ?: "a message"),
+            color = AccentBlue,
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onCancel) { Text("✕", color = TextSecondary, fontSize = 14.sp) }
     }
 }
 
@@ -6674,7 +6992,8 @@ private fun SearchScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 SearchTab("Messages", tab == 0) { tab = 0 }
-                SearchTab("Highlights", tab == 1) { tab = 1 }
+                // Lurker 2.4 renamed it: reactions to your lines show here too.
+                SearchTab(if (client.activityFeed) "Activity" else "Highlights", tab == 1) { tab = 1 }
                 SearchTab("Bookmarks", tab == 2) { tab = 2 }
             }
             if (tab == 0) {
@@ -6806,7 +7125,23 @@ private fun ResultRow(client: LurkerClient, r: SearchResult, onOpen: (Int, Strin
             )
             formatTime(r.createdAt)?.let { Text(it, color = TextSecondary, fontSize = 11.sp) }
         }
-        Text(mircAnnotated(r.body, AccentBlue), fontSize = 15.sp, color = TextPrimary, modifier = Modifier.padding(top = 2.dp))
+        if (r.reaction != null) {
+            // Activity: someone reacted to your line ([body] is that line).
+            Text("reacted ${r.reaction}", color = AccentBlue, fontSize = 14.sp, modifier = Modifier.padding(top = 2.dp))
+            Text(
+                "↪ " + Mirc.strip(r.body).replace('\n', ' '),
+                color = TextSecondary, fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
+        } else {
+            r.replyTo?.let { p ->
+                Text(
+                    "↪ ${p.nick}: " + Mirc.strip(p.text).replace('\n', ' '),
+                    color = TextSecondary, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            Text(mircAnnotated(r.body, AccentBlue), fontSize = 15.sp, color = TextPrimary, modifier = Modifier.padding(top = 2.dp))
+        }
     }
     HorizontalDivider(color = SurfaceRaised, modifier = Modifier.padding(start = 16.dp))
 }

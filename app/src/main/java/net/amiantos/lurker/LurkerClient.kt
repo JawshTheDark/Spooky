@@ -352,6 +352,34 @@ open class LurkerClient {
      *  `dccChatOffers` — a missed close would otherwise leave an Accept button
      *  that quietly sends the peer a FRESH offer instead. */
     val dccChatOffers = mutableStateMapOf<String, DccChatOffer>()
+
+    /**
+     * IRCv3 reactions standing on each line we've seen, by message id (Lurker
+     * 2.4+). Kept beside the rows rather than on them, as the web client does:
+     * history pages and resumes replace whole lists, and a side map survives all
+     * of that. A row that arrives is authoritative for itself (no `reactions` =
+     * none stand now); a `reaction` frame adds or removes one live.
+     */
+    val reactions = mutableStateMapOf<Long, List<Reaction>>()
+
+    /** networkId -> whether a reaction can go out there right now (`canReact`). */
+    val networkCanReact = mutableStateMapOf<Int, Boolean>()
+
+    /** bufferKey -> the reply that buffer's composer is writing (draft-synced). */
+    val draftReplies = mutableStateMapOf<String, DraftReply>()
+
+    /** The longest edge the server keeps of a static image (Lurker 2.4+), or 0
+     *  when it doesn't say — then images upload as-is. */
+    var maxStaticImageDimension by mutableStateOf(0)
+        private set
+
+    /** The current burst is a `?since=` resume: reactions changed while we were
+     *  away don't ride it, so ask for them once it completes. */
+    private var burstIsResume = false
+
+    /** The server knows reactions (its snapshot carries `canReact`), so it
+     *  understands `sync-reactions` — an older one would answer it with an error. */
+    private var serverHasReactions = false
     var dccError by mutableStateOf<String?>(null)
     var dccEnabled by mutableStateOf(true)
         private set
@@ -626,6 +654,14 @@ open class LurkerClient {
             transfers.clear()
             dccChatsLive.clear()
             dccChatOffers.clear()
+            reactions.clear()
+            networkCanReact.clear()
+            serverHasReactions = false
+            draftReplies.clear()
+            maxStaticImageDimension = 0
+            activityFeed = false
+            activityUnsupported = false
+            activityNext = null
             drafts.clear()
             inputHistory.clear()
             aliases.clear()
@@ -1069,6 +1105,7 @@ open class LurkerClient {
         // older than its minimum instead of feeding it frames it would mis-render.
         val wsBase = baseUrl.replaceFirst("http", "ws") + "/ws?v=$PROTOCOL_VERSION"
         val wsUrl = if (since != null && since > 0) "$wsBase&since=$since" else wsBase
+        burstIsResume = since != null && since > 0
         val req = Request.Builder()
             .url(wsUrl)
             .header("Authorization", "Bearer ${token!!}")
@@ -1210,6 +1247,7 @@ open class LurkerClient {
                 // 0 on an older server that doesn't advertise a cap — we then
                 // upload unchecked exactly as before and let the 413 decide.
                 if (frame.has("maxUploadBytes")) maxUploadBytes = frame.optLong("maxUploadBytes")
+                maxStaticImageDimension = frame.optInt("maxStaticImageDimension", 0).coerceAtLeast(0)
             }
 
             // The burst's terminal frame. A fresh burst (reconnect, in-band resync,
@@ -1219,6 +1257,10 @@ open class LurkerClient {
             "backlog-complete" -> {
                 snapshotComplete = true
                 reconcileBuffers()
+                if (burstIsResume) {
+                    burstIsResume = false
+                    syncReactions()
+                }
                 DebugLog.i("ws", "backlog-complete (${buffers.size} buffers)")
             }
 
@@ -1227,6 +1269,23 @@ open class LurkerClient {
             // the rest of the session.
             "settings" -> {
                 if (frame.has("maxUploadBytes")) maxUploadBytes = frame.optLong("maxUploadBytes")
+                if (frame.has("maxStaticImageDimension")) {
+                    maxStaticImageDimension = frame.optInt("maxStaticImageDimension", 0).coerceAtLeast(0)
+                }
+            }
+
+            // IRCv3 reactions (Lurker 2.4+): one added or taken back, live.
+            "reaction" -> applyReactionFrame(frame)
+            // The answer to sync-reactions: authoritative for every id asked about.
+            "reactions-sync" -> {
+                val ids = frame.optJSONArray("messageIds") ?: return
+                val byId = frame.optJSONObject("reactions")
+                for (i in 0 until ids.length()) {
+                    val id = ids.optLong(i)
+                    if (id <= 0) continue
+                    val list = parseReactions(byId?.optJSONArray(id.toString()))
+                    if (list.isEmpty()) reactions.remove(id) else reactions[id] = list
+                }
             }
 
             "ignore-list-updated" -> {
@@ -1243,6 +1302,7 @@ open class LurkerClient {
                 val events = frame.optJSONArray("events")
                 bumpCursorFromEvents(events)
                 val reset = frame.optBoolean("reset", false)
+                noteReactions(events, networkId)
                 val parsed = parseEvents(events)
                 mergeInto(buffer.key, parsed, replace = reset || messagesByBuffer[buffer.key] == null)
                 seedUnread(buffer.key, frame)
@@ -1297,6 +1357,11 @@ open class LurkerClient {
                 // DCC CHAT lifecycle: ephemeral, aimed at the :server: pseudo-buffer
                 // with the peer in `from` — never a chat row, never a buffer.
                 when (frame.optString("type")) {
+                    // Whether reactions can be sent on this network changed (2.4+).
+                    "react-support" -> {
+                        if (networkId != null) networkCanReact[networkId] = frame.optBoolean("canReact", false)
+                        return
+                    }
                     "dcc-chat-offer", "dcc-chat-offer-closed", "dcc-chat-state" -> {
                         if (networkId != null) applyDccChatEvent(networkId, frame)
                         return
@@ -1401,6 +1466,7 @@ open class LurkerClient {
                 // Roster updates ride the same stream; apply before the renderable
                 // check (names/channel-parted produce no chat line at all).
                 applyMemberEvent(buffer.key, frame)
+                if (networkId != null && frame.optLong("id") > 0) noteReactionRow(frame)
                 val msg = parseEvent(frame) ?: return
                 // A re-delivered message (e.g. the boundary id on a ?since= resume)
                 // is deduped by mergeInto — don't re-count its badge or re-notify.
@@ -1486,12 +1552,15 @@ open class LurkerClient {
 
             "draft-snapshot" -> {
                 drafts.clear()
+                draftReplies.clear()
                 frame.optJSONArray("drafts")?.let { arr ->
                     for (i in 0 until arr.length()) {
                         val d = arr.optJSONObject(i) ?: continue
                         val key = "${d.optInt("networkId")}::${d.optString("target")}"
                         val body = d.optString("body")
                         if (body.isNotEmpty()) drafts[key] = body
+                        // A draft's reply follows the user across devices (2.4+).
+                        parseDraftReply(d.optJSONObject("reply"))?.let { draftReplies[key] = it }
                     }
                 }
             }
@@ -1501,6 +1570,11 @@ open class LurkerClient {
                 if (key !in draftPending) {
                     val body = frame.optString("body")
                     if (body.isEmpty()) drafts.remove(key) else drafts[key] = body
+                    // Absent on a server that predates replies: leave ours alone.
+                    if (frame.has("reply")) {
+                        val r = parseDraftReply(frame.optJSONObject("reply"))
+                        if (r == null) draftReplies.remove(key) else draftReplies[key] = r
+                    }
                 }
             }
             "input-history-added" -> {
@@ -1603,6 +1677,7 @@ open class LurkerClient {
                 frame.optJSONArray("inputHistory")?.let { h ->
                     inputHistory[key] = (0 until h.length()).map { h.optString(it) }
                 }
+                noteReactions(frame.optJSONArray("events"), networkId)
                 val parsed = parseEvents(frame.optJSONArray("events"))
                 if (parsed.isEmpty()) return
                 val existing = messagesByBuffer[key] ?: emptyList()
@@ -1673,6 +1748,7 @@ open class LurkerClient {
         moveEntry(members, old, new) { a, _ -> a }        // survivor's roster is current
         moveEntry(typing, old, new) { a, b -> a + b }
         moveEntry(drafts, old, new) { a, b -> if (a.isBlank()) b else a }
+        moveEntry(draftReplies, old, new) { a, _ -> a }
         moveEntry(inputHistory, old, new) { a, _ -> a }
         moveEntry(topics, old, new) { a, _ -> a }
         moveEntry(channelModes, old, new) { a, _ -> a }
@@ -1891,6 +1967,10 @@ open class LurkerClient {
                     chanTypes = si.optString("chanTypes"),
                 )
             }
+            // Whether a reaction can go out here (Lurker 2.4+). Absent on a
+            // disconnected network: treat as false.
+            networkCanReact[id] = n.optBoolean("canReact", false)
+            if (n.has("canReact")) serverHasReactions = true
             // DCC CHAT state rides every snapshot: replace this network's slice.
             n.optJSONArray("dccChats")?.let { live ->
                 dccChatsLive.removeAll { it.startsWith("$id::") }
@@ -2291,9 +2371,26 @@ open class LurkerClient {
 
     /** Update a buffer's draft locally and debounce-sync it (500ms, like web). */
     fun setDraftLocal(buffer: Buffer, text: String) {
-        val networkId = buffer.networkId ?: return
+        if (buffer.networkId == null) return
         val key = buffer.key
         if (text.isEmpty()) drafts.remove(key) else drafts[key] = text
+        scheduleDraftFlush(buffer)
+    }
+
+    /** Start (or cancel, with null) a reply in [buffer]'s composer. Part of the
+     *  draft, so it syncs to the account's other devices like the text does. */
+    fun setDraftReply(buffer: Buffer, reply: DraftReply?) {
+        if (buffer.networkId == null) return
+        if (reply == null) draftReplies.remove(buffer.key) else draftReplies[buffer.key] = reply
+        scheduleDraftFlush(buffer)
+    }
+
+    /** Drop the reply without syncing — the send that used it clears the whole
+     *  draft server-side anyway. */
+    fun consumeDraftReply(buffer: Buffer): DraftReply? = draftReplies.remove(buffer.key)
+
+    private fun scheduleDraftFlush(buffer: Buffer) {
+        val key = buffer.key
         draftPending.add(key)
         draftFlush.remove(key)?.let(main::removeCallbacks)
         val r = Runnable { flushDraft(buffer) }
@@ -2309,10 +2406,21 @@ open class LurkerClient {
         if (key !in draftPending) return
         draftPending.remove(key)
         val body = drafts[key].orEmpty()
+        val reply = draftReplies[key]
         ws?.send(
             JSONObject().put("networkId", networkId).put("target", buffer.target).apply {
-                if (body.isEmpty()) put("type", "draft-clear")
-                else put("type", "draft-set").put("body", body)
+                if (body.isEmpty() && reply == null) {
+                    put("type", "draft-clear")
+                } else {
+                    put("type", "draft-set").put("body", body)
+                    // Always say it: `reply: null` clears one set elsewhere. A
+                    // pre-2.4 server ignores the field.
+                    put(
+                        "reply",
+                        reply?.let { JSONObject().put("messageId", it.messageId).put("addressed", it.addressed) }
+                            ?: JSONObject.NULL,
+                    )
+                }
             }.toString(),
         )
     }
@@ -2457,8 +2565,12 @@ open class LurkerClient {
                 self = e.optBoolean("self", false), time = e.optString("time").ifEmpty { null },
                 // Persisted flag: the message rode E2E (server already decrypted it).
                 e2e = e.optBoolean("e2e", false),
-                // Highlight rule hit (a mention / your nick) — gold background.
-                matched = e.optBoolean("matched", false),
+                // Highlight rule hit (a mention / your nick) — gold background. A
+                // reply to one of your lines is one too (the server stamps both).
+                matched = e.optBoolean("matched", false) || e.optBoolean("replyToSelf", false),
+                msgid = if (e.isNull("msgid")) null else e.optString("msgid").ifEmpty { null },
+                replyTo = parseReplyRef(e.optJSONObject("replyTo")),
+                replyToSelf = e.optBoolean("replyToSelf", false),
             )
             // The server's own voice: a 401 routed into a channel or DM ("gnat
             // isn't on this network."), a rejected command, an ircd error. It has
@@ -2686,6 +2798,9 @@ open class LurkerClient {
             when (op.type) {
                 "send", "action", "notice" -> {
                     frame.put("type", op.type).put("target", target).put("text", op.text)
+                    // An IRCv3 reply (2.4+): the server tags the first line out, or
+                    // sends it as a plain line when the network can't carry it.
+                    if (op.type != "notice") op.replyTo?.let { frame.put("replyTo", it) }
                     // Correlate with the send-result ack so a rejected or lost
                     // message is surfaced instead of silently vanishing.
                     val clientId = "a${++clientIdSeq}"
@@ -2730,6 +2845,21 @@ open class LurkerClient {
                     op.reason?.let { frame.put("reason", it) } // /part's leave message
                 }
                 "clear" -> frame.put("type", "clear-buffer").put("target", target)
+                "away" -> {
+                    val message = op.text.orEmpty()
+                    if (op.all ?: settingBool("away.all_networks", false)) {
+                        // Every network: the user-scoped verb with no networkId,
+                        // which every Lurker version reads as "all of them".
+                        frame.remove("networkId")
+                        if (message.isEmpty()) frame.put("type", "back")
+                        else frame.put("type", "away").put("message", message)
+                        frame.put("all", true)
+                    } else {
+                        // Just this network: a plain AWAY, which means exactly that
+                        // on any server version.
+                        frame.put("type", "raw").put("line", if (message.isEmpty()) "AWAY" else "AWAY :$message")
+                    }
+                }
                 else -> continue
             }
             // okhttp refuses (false) once the socket has failed or closed, and the
@@ -3046,6 +3176,138 @@ open class LurkerClient {
         }
     }
 
+    // ---- Reactions + replies (Lurker 2.4+) ------------------------------------
+
+    /** Whether [msg] can be reacted to here: a stored message/action carrying a
+     *  msgid, on a connected network that can send the tags, never E2E. */
+    fun canReact(buffer: Buffer, msg: Msg): Boolean {
+        val nid = buffer.networkId ?: return false
+        return serverFeatures && networkCanReact[nid] == true && networks[nid]?.connected == true &&
+            msg.id > 0 && msg.msgid != null && (msg.type == "message" || msg.type == "action") &&
+            !msg.e2e && buffer.key !in e2eSeen &&
+            !buffer.isServerBuffer && !buffer.isDccChat
+    }
+
+    /** Whether a reply to [msg] can name it (it needs a msgid). Where it can't,
+     *  Reply falls back to the plain "nick, " address. */
+    fun canReplyTo(buffer: Buffer, msg: Msg): Boolean =
+        serverFeatures && buffer.networkId != null && msg.id > 0 && msg.msgid != null &&
+            msg.type in setOf("message", "action", "notice") &&
+            !msg.e2e && buffer.key !in e2eSeen &&
+            !buffer.isServerBuffer && !buffer.isDccChat
+
+    /** React with [value] on a line, or take ours back if it's already there.
+     *  Never optimistic: the server's `reaction` echo is what lights it up, and a
+     *  refusal is silence. */
+    fun react(messageId: Long, value: String) {
+        val v = value.trim()
+        if (messageId <= 0 || !isValidReaction(v)) return
+        val mine = reactions[messageId].orEmpty().any { it.self && it.value == v }
+        ws?.send(
+            JSONObject().put("type", "react").put("messageId", messageId).put("value", v)
+                .put("remove", mine).toString(),
+        )
+    }
+
+    private fun parseReactions(arr: JSONArray?): List<Reaction> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val r = arr.optJSONObject(i) ?: return@mapNotNull null
+            val value = r.optString("value")
+            if (value.isEmpty()) null
+            else Reaction(if (r.isNull("nick")) "*" else r.optString("nick", "*"), value, r.optBoolean("self", false))
+        }
+    }
+
+    /** A row is authoritative for itself: no `reactions` means none stand now. */
+    private fun noteReactionRow(e: JSONObject) {
+        val id = e.optLong("id")
+        if (id <= 0) return
+        val list = parseReactions(e.optJSONArray("reactions"))
+        if (list.isEmpty()) reactions.remove(id) else reactions[id] = list
+    }
+
+    /** Reconcile against a page of rows. The system buffer's ids are a separate
+     *  sequence that overlaps this one, so it's skipped. */
+    private fun noteReactions(events: JSONArray?, networkId: Int?) {
+        if (events == null || networkId == null) return
+        for (i in 0 until events.length()) events.optJSONObject(i)?.let(::noteReactionRow)
+    }
+
+    private fun applyReactionFrame(f: JSONObject) {
+        val id = f.optLong("messageId")
+        val value = f.optString("value")
+        if (id <= 0 || value.isEmpty()) return
+        val nick = f.optString("nick")
+        val self = f.optBoolean("self", false)
+        val cur = reactions[id].orEmpty()
+        if (f.optBoolean("remove", false)) {
+            // Ours goes by `self`, not nick: we may have reacted under an older nick.
+            val list = cur.filterNot { r ->
+                if (self) r.self && r.value == value else r.value == value && r.nick.equals(nick, true)
+            }
+            if (list.isEmpty()) reactions.remove(id) else reactions[id] = list
+            // A reaction to your line taken back leaves the activity feed too.
+            if (f.optBoolean("toSelf", false) && !self) {
+                highlightItems.removeAll { it.id == id && it.reaction == value && it.nick.equals(nick, true) }
+            }
+        } else if (cur.none { it.value == value && it.nick.equals(nick, true) }) {
+            // Appended, so a chip keeps its place and a new one goes last.
+            reactions[id] = cur + Reaction(nick, value, self)
+        }
+    }
+
+    /**
+     * After a resume, ask what stands now on the lines we already hold: a
+     * `reaction` frame only reaches a connected socket, and `?since=` ships only
+     * new rows. The newest 200 lines of each buffer, within the server's 5000 cap.
+     */
+    private fun syncReactions() {
+        if (!serverHasReactions) return
+        val ids = ArrayList<Long>()
+        for (b in buffers) {
+            if (b.networkId == null) continue
+            val msgs = messagesByBuffer[b.key] ?: continue
+            var n = 0
+            for (i in msgs.indices.reversed()) {
+                val id = msgs[i].id
+                if (id <= 0) continue
+                ids.add(id)
+                if (++n >= 200) break
+            }
+            if (ids.size >= 5_000) break
+        }
+        if (ids.isEmpty()) return
+        ws?.send(JSONObject().put("type", "sync-reactions").put("messageIds", JSONArray(ids.take(5_000))).toString())
+    }
+
+    private fun parseReplyParent(o: JSONObject?): ReplyParent? {
+        if (o == null) return null
+        val id = o.optLong("id")
+        if (id <= 0) return null
+        return ReplyParent(
+            id = id,
+            nick = if (o.isNull("nick")) "*" else o.optString("nick", "*"),
+            type = o.optString("type", "message"),
+            text = o.optString("text"),
+            self = o.optBoolean("self", false),
+        )
+    }
+
+    private fun parseReplyRef(o: JSONObject?): ReplyRef? {
+        if (o == null) return null
+        val msgid = o.optString("msgid")
+        if (msgid.isEmpty()) return null
+        return ReplyRef(msgid, parseReplyParent(o.optJSONObject("parent")))
+    }
+
+    private fun parseDraftReply(o: JSONObject?): DraftReply? {
+        if (o == null) return null
+        val id = o.optLong("messageId")
+        if (id <= 0) return null
+        return DraftReply(id, o.optBoolean("addressed", false), parseReplyParent(o.optJSONObject("parent")))
+    }
+
     // ---- Search + highlights ------------------------------------------------
 
     /** Run a fresh search from raw `from:/in:/on: text` input. */
@@ -3100,16 +3362,31 @@ open class LurkerClient {
             // Search rows use DB columns (body/createdAt); fall back to live-frame names.
             body = o.optString("body").ifEmpty { o.optString("text") },
             createdAt = o.optString("createdAt").ifEmpty { o.optString("time").ifEmpty { null } },
+            replyTo = parseReplyRef(o.optJSONObject("replyTo"))?.parent,
         )
     }
 
-    /** GET /api/highlights — paginated recent highlight messages (REST). */
+    /** True once the server answered `/api/activity` (Lurker 2.4+): the tab reads
+     *  "Activity" and reaction items appear beside highlights. */
+    var activityFeed by mutableStateOf(false)
+        private set
+    private var activityUnsupported = false
+    private var activityNext: JSONObject? = null
+
+    /**
+     * The highlights tab. On Lurker 2.4+ it's the activity feed — highlights plus
+     * other people's reactions to your lines — paged by an opaque `next` cursor;
+     * an older server 404s that and gets `/api/highlights`, as before.
+     */
     fun loadHighlights(fresh: Boolean) {
         if (highlightsLoading) return
-        if (fresh) { highlightItems.clear(); highlightsNextBefore = null }
+        if (fresh) { highlightItems.clear(); highlightsNextBefore = null; activityNext = null }
         val before = highlightsNextBefore
+        val next = activityNext
+        if (!fresh && activityFeed && next == null) return
         post { highlightsLoading = true }
         io.execute {
+            if (!activityUnsupported && loadActivity(next)) return@execute
             try {
                 val path = "/api/highlights?limit=50" + (before?.let { "&before=$it" } ?: "")
                 rest.newCall(authed(path).build()).execute().use { res ->
@@ -3134,6 +3411,66 @@ open class LurkerClient {
             } catch (_: Exception) {
                 post { highlightsLoading = false }
             }
+        }
+    }
+
+    /** One page of `/api/activity`. False when the server doesn't have it (older
+     *  than 2.4), so the caller falls back to highlights. */
+    private fun loadActivity(cursor: JSONObject?): Boolean {
+        try {
+            val q = StringBuilder("/api/activity?limit=50")
+            cursor?.keys()?.forEach { k ->
+                val v = cursor.opt(k)
+                if (v != null && v != JSONObject.NULL) q.append('&').append(k).append('=').append(v)
+            }
+            rest.newCall(authed(q.toString()).build()).execute().use { res ->
+                if (res.code == 404) {
+                    activityUnsupported = true
+                    return false
+                }
+                if (!res.isSuccessful) {
+                    post { highlightsLoading = false }
+                    return true
+                }
+                // Not JSON (a proxy's page, an old server's HTML): no feed here.
+                val obj = runCatching { JSONObject(res.body?.string().orEmpty()) }.getOrNull()
+                    ?: run { activityUnsupported = true; return false }
+                val arr = obj.optJSONArray("items")
+                val nextCursor = obj.optJSONObject("next")
+                val rows = ArrayList<SearchResult>()
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    if (o.optString("kind") == "reaction") {
+                        val id = o.optLong("id", -1)
+                        val value = o.optString("value")
+                        if (id < 0 || value.isEmpty()) continue
+                        rows.add(
+                            SearchResult(
+                                id = id,
+                                networkId = o.optInt("networkId", -1),
+                                target = o.optString("target"),
+                                nick = if (o.isNull("nick")) "*" else o.optString("nick", "*"),
+                                body = o.optString("text"),
+                                createdAt = o.optString("time").ifEmpty { null },
+                                reaction = value,
+                            ),
+                        )
+                    } else {
+                        parseResultRow(o)?.let(rows::add)
+                    }
+                }
+                post {
+                    activityFeed = true
+                    highlightItems.addAll(rows)
+                    activityNext = nextCursor
+                    highlightsHasMore = nextCursor != null
+                    highlightsLoading = false
+                }
+                return true
+            }
+        } catch (_: Exception) {
+            post { highlightsLoading = false }
+            return true
         }
     }
 

@@ -25,6 +25,11 @@ data class WireOp(
     val line: String? = null,
     val channel: String? = null,
     val reason: String? = null,
+    /** send/action: the stored line this answers (an IRCv3 reply, Lurker 2.4+). */
+    val replyTo: Long? = null,
+    /** away: true = every network, false = this one, null = the user's
+     *  `away.all_networks` setting decides (Lurker 2.4's /away semantics). */
+    val all: Boolean? = null,
 )
 
 sealed interface ParsedInput {
@@ -252,8 +257,15 @@ object Commands {
             "cs", "chanserv" -> if (rest.isEmpty()) err("Usage: /cs <command>") else raw("PRIVMSG ChanServ :$rest")
             "ms", "memoserv" -> if (rest.isEmpty()) err("Usage: /ms <command>") else raw("PRIVMSG MemoServ :$rest")
 
-            "away" -> if (rest.isEmpty()) raw("AWAY") else raw("AWAY :$rest")
-            "back" -> raw("AWAY")
+            // Lurker 2.4: /away is per network unless `-all` (or the user's
+            // away.all_networks setting); `-one` forces just this one. An empty
+            // message is /back. Resolved by the backend, which knows the setting.
+            "away", "back" -> {
+                val words = rest.split(Regex("\\s+"), limit = 2)
+                val flag = words[0].lowercase().takeIf { it == "-all" || it == "-one" }
+                val message = if (verb == "back") "" else if (flag != null) words.getOrElse(1) { "" }.trim() else rest
+                ParsedInput.Ops(listOf(WireOp("away", text = message, all = flag?.let { it == "-all" })))
+            }
 
             "ctcp" -> {
                 val (who, body) = splitTargetAndBody(rest) ?: return err("Usage: /ctcp <nick> <TYPE> [args]")
@@ -332,7 +344,7 @@ object Commands {
         appendLine("/me, /msg, /query, /notice, /join, /part, /close, /clear")
         appendLine("/list [filter], /nick, /topic, /kick, /invite, /mode, /whois")
         appendLine("/op, /deop, /voice, /devoice, /ban, /unban")
-        appendLine("/away, /back, /ctcp, /ping, /slap, /cycle, /quit")
+        appendLine("/away [-all|-one] [message], /back [-all], /ctcp, /ping, /slap, /cycle, /quit")
         appendLine("/ns, /cs, /ms, /raw <line>")
         appendLine("/dcc chat [-passive] <nick>, /dcc close chat <nick>")
         append("Prefix a literal slash with // to send it as a message.")

@@ -127,10 +127,67 @@ data class Msg(
     /** Set on an undelivered-send line; keys the [FailedSend] holding the original
      *  text so the row can offer Resend / Discard. */
     val failedId: String? = null,
-    /** IRCv3 `msgid` (direct mode). A bouncer replays its buffer with the same
-     *  ids on every reconnect, so this is what tells a replay from a new line. */
+    /** IRCv3 `msgid`. In Lurker mode it's what a reaction or reply names, so a
+     *  line without one can't be reacted or replied to. In direct mode, a
+     *  bouncer replays its buffer with the same ids on every reconnect, so it's
+     *  what tells a replay from a new line. */
     val msgid: String? = null,
+    /** Set when this line is an IRCv3 reply (Lurker 2.4+). */
+    val replyTo: ReplyRef? = null,
+    /** Someone else replied to one of YOUR lines: a highlight, tinted and counted
+     *  as one. Read from the server's stamp, not [ReplyRef.parent]: the parent can
+     *  be gone while the stamp is what the server's counts use. */
+    val replyToSelf: Boolean = false,
 )
+
+/** The line an IRCv3 reply answers. [parent] is null when the server no longer
+ *  holds it (retention, before your history, an ignored author): show the reply
+ *  without its context. */
+data class ReplyRef(val msgid: String, val parent: ReplyParent?)
+
+/** An answered line as the server quotes it: [text] is clipped to 300 characters
+ *  with formatting codes intact, [id] is the jump target. */
+data class ReplyParent(
+    val id: Long,
+    val nick: String,
+    val type: String,
+    val text: String,
+    val self: Boolean,
+)
+
+/** One IRCv3 reaction standing on a line (Lurker 2.4+). [self] is yours. */
+data class Reaction(val nick: String, val value: String, val self: Boolean)
+
+/** One chip on a line's reaction row: a value, who reacted with it, and whether
+ *  you're among them. */
+data class ReactionGroup(val value: String, val nicks: List<String>, val mine: Boolean)
+
+/** Group a line's reactions by value, first-reacted first (the web client's order). */
+fun groupReactions(list: List<Reaction>?): List<ReactionGroup> {
+    if (list.isNullOrEmpty()) return emptyList()
+    val order = LinkedHashMap<String, MutableList<Reaction>>()
+    for (r in list) order.getOrPut(r.value) { mutableListOf() }.add(r)
+    return order.map { (value, rs) -> ReactionGroup(value, rs.map { it.nick }, rs.any { it.self }) }
+}
+
+/** The reply a composer is writing — part of its draft, so it follows the user
+ *  to another device. [addressed]: Reply also put "nick, " into the text, which
+ *  cancelling should take back out. */
+data class DraftReply(val messageId: Long, val addressed: Boolean, val parent: ReplyParent?)
+
+/** Longest reaction the server accepts, in grapheme clusters (shared/reactions.ts). */
+const val MAX_REACTION_GRAPHEMES = 64
+
+/** A sendable reaction: non-blank, single line, at most [MAX_REACTION_GRAPHEMES]
+ *  user-perceived characters (an emoji with modifiers counts once). */
+fun isValidReaction(value: String): Boolean {
+    if (value.isBlank() || value.contains('\n') || value.contains('\r')) return false
+    val it = java.text.BreakIterator.getCharacterInstance()
+    it.setText(value)
+    var n = 0
+    while (it.next() != java.text.BreakIterator.DONE) if (++n > MAX_REACTION_GRAPHEMES) return false
+    return true
+}
 
 /** A message that never made it out — the socket was down, the server rejected it,
  *  or no ack arrived. Retained so the user can resend it verbatim. */
@@ -226,7 +283,7 @@ data class IgnoreRule(
 /** A row in the /LIST channel browser. */
 data class ChannelListing(val channel: String, val users: Int, val topic: String)
 
-/** One search / highlights result row (decorated DB message: body + createdAt). */
+/** One search / highlights / activity row (decorated DB message: body + createdAt). */
 data class SearchResult(
     val id: Long,
     val networkId: Int,
@@ -234,6 +291,11 @@ data class SearchResult(
     val nick: String,
     val body: String,
     val createdAt: String?,
+    /** Activity feed (Lurker 2.4+): set on a reaction item — [nick] reacted with
+     *  this to your line, whose text is [body]. Null on a message row. */
+    val reaction: String? = null,
+    /** The line a reply row answers, when the server quotes it. */
+    val replyTo: ReplyParent? = null,
 )
 
 /**
@@ -268,6 +330,22 @@ data class Member(
             "v" in modes -> 4
             else -> 5
         }
+
+    /** The glyph for this member's highest rank on a network that advertised its
+     *  PREFIX (`(qaohv)~&@%+`, or whatever ladder that ircd uses), in that order —
+     *  Lurker 2.4 follows the network the same way. Falls back to [prefix]. */
+    fun prefixFor(ladder: List<Pair<Char, Char>>?): String {
+        if (ladder.isNullOrEmpty()) return prefix
+        return ladder.firstOrNull { (mode, _) -> mode.toString() in modes }?.second?.toString() ?: ""
+    }
+
+    /** Sort rank on a network's own PREFIX ladder (highest first, plain members
+     *  last); falls back to [rank]. */
+    fun rankFor(ladder: List<Pair<Char, Char>>?): Int {
+        if (ladder.isNullOrEmpty()) return rank
+        val i = ladder.indexOfFirst { (mode, _) -> mode.toString() in modes }
+        return if (i >= 0) i else ladder.size
+    }
 
     /** Can this member moderate (op-gated menu actions)? Mirrors the web's MODERATE_MODES. */
     val canModerate: Boolean get() = modes.any { it == "q" || it == "a" || it == "o" || it == "h" }

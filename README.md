@@ -1,4 +1,4 @@
-# Lurker for Android
+# Spooky for Lurker
 
 A native Android client for [Lurker](https://github.com/amiantos/lurker) — Kotlin + Jetpack Compose,
 built to feel like a modern messaging app rather than a terminal. It talks to a Lurker bouncer server

@@ -31,6 +31,28 @@ fun mediaKindForUrl(url: String): MediaKind? {
     }
 }
 
+/**
+ * A GIPHY link as its plain direct GIF, or null if [url] isn't one.
+ *
+ * GIPHY share links are web pages (`giphy.com/gifs/some-title-<id>`), which
+ * don't embed; keyboard GIFs arrive as media links carrying tracking queries
+ * (`media2.giphy.com/media/v1.…/<id>/giphy.gif?cid=…`). Both name the same file
+ * by its id, so send `https://media.giphy.com/media/<id>/giphy.gif` — short,
+ * untracked, and a .gif every client embeds.
+ */
+fun giphyDirectGif(url: String): String? {
+    val u = url.trim()
+    val page = Regex(
+        """^https?://(?:www\.)?giphy\.com/(?:gifs|stickers|embed|clips)/(?:[^/?#]*-)?([A-Za-z0-9]{8,})/?(?:[?#].*)?$""",
+    )
+    val media = Regex(
+        """^https?://(?:media\d*|i)\.giphy\.com/media/(?:v1\.[^/]+/)?([A-Za-z0-9]{8,})/[^?#]*\.(?:gif|webp|mp4)(?:[?#].*)?$""",
+    )
+    val short = Regex("""^https?://i\.giphy\.com/([A-Za-z0-9]{8,})\.(?:gif|webp)(?:[?#].*)?$""")
+    val id = (page.find(u) ?: media.find(u) ?: short.find(u))?.groupValues?.get(1) ?: return null
+    return "https://media.giphy.com/media/$id/giphy.gif"
+}
+
 /** The media URLs in a message body, capped so one paste can't flood a bubble. */
 fun mediaUrlsIn(text: String, limit: Int = 3): List<Pair<String, MediaKind>> =
     Mirc.urls(text).mapNotNull { u -> mediaKindForUrl(u)?.let { u to it } }.take(limit)

@@ -73,6 +73,12 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("inlineMedia", true)
         set(value) = sp.edit { putBoolean("inlineMedia", value) }
 
+    /** A GIF from the keyboard (GIPHY/Tenor) or a pasted image: upload the file
+     *  through the server (true) or send its link (false, the default). */
+    var gifUpload: Boolean
+        get() = sp.getBoolean("gifUpload", false)
+        set(value) = sp.edit { putBoolean("gifUpload", value) }
+
     /** Fetch OpenGraph cards (title/description/image) for pasted links that
      *  aren't already inline media (default on). */
     var linkPreviews: Boolean

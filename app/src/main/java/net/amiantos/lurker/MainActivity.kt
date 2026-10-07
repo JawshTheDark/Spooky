@@ -15,6 +15,13 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.content.MediaType
+import androidx.compose.foundation.content.ReceiveContentListener
+import androidx.compose.foundation.content.consume
+import androidx.compose.foundation.content.contentReceiver
+import androidx.compose.foundation.content.hasMediaType
+import androidx.compose.foundation.text.input.TextFieldState
+import kotlin.reflect.KProperty
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -361,6 +368,7 @@ class MainActivity : FragmentActivity() {
         locked = prefs.biometricLock && !(application as LurkerApp).unlocked
         Ui.theme = AppTheme.from(prefs.theme)
         Ui.inlineMedia = prefs.inlineMedia
+        Ui.gifUpload = prefs.gifUpload
         Ui.linkPreviews = prefs.linkPreviews
         Ui.youtubeDescriptions = prefs.youtubeDescriptions
         Ui.translateBackend = when (prefs.translateBackend) {
@@ -2157,9 +2165,30 @@ private fun ChatScreen(
     // the process-scoped client), but seeding with a bare TextFieldValue parked the
     // caret at position 0 — so a rotate mid-sentence, or reopening a buffer with a
     // draft, dropped you at the START of your own text. Seed the caret at the end.
-    var draft by remember(buffer.key) {
+    // The composer's text lives in a TextFieldState (the only text field that can
+    // receive GIFs from the keyboard); `draft` reads and writes it as before.
+    val draftField = remember(buffer.key) {
         val seed = client.drafts[buffer.key] ?: ""
-        mutableStateOf(TextFieldValue(seed, TextRange(seed.length)))
+        DraftField(TextFieldState(seed, TextRange(seed.length)))
+    }
+    var draft by draftField
+    // Typing edits the field directly, so its side effects hang off the field:
+    // sync the draft, and say we're typing — but not for text set programmatically
+    // (a reply's "nick, ", a suggestion, a translation), which isn't typing.
+    LaunchedEffect(draftField) {
+        var prev = draftField.state.text.toString()
+        snapshotFlow { draftField.state.text.toString() }.collect { t ->
+            if (t == prev) return@collect
+            if (t != (client.drafts[buffer.key] ?: "")) client.setDraftLocal(buffer, t)
+            val programmatic = t == draftField.lastSetText
+            draftField.lastSetText = null
+            if (!programmatic) {
+                // Commands never broadcast composing state.
+                if (t.isNotBlank() && !t.startsWith("/")) client.notifyTyping(buffer, active = true)
+                else if (prev.isNotBlank() && t.isBlank()) client.notifyTyping(buffer, active = false)
+            }
+            prev = t
+        }
     }
     // Flush the draft when leaving this buffer.
     DisposableEffect(buffer.key) { onDispose { client.flushDraft(buffer) } }
@@ -2510,6 +2539,42 @@ private fun ChatScreen(
         pinnedToTail = true
         chatScope.launch {
             listState.scrollToItem((rows.lastIndex + headerCount).coerceAtLeast(0))
+        }
+    }
+    // Put [text] at the cursor, spaced from what's around it.
+    fun insertIntoDraft(text: String) {
+        val cur = draft
+        val start = cur.selection.min.coerceIn(0, cur.text.length)
+        val end = cur.selection.max.coerceIn(0, cur.text.length)
+        val before = cur.text.substring(0, start)
+        val lead = if (before.isEmpty() || before.endsWith(" ")) "" else " "
+        val ins = "$lead$text "
+        val t = before + ins + cur.text.substring(end)
+        draft = TextFieldValue(t, TextRange(before.length + ins.length))
+        client.setDraftLocal(buffer, t)
+    }
+    // The keyboard's read grant on its content can lapse while an upload waits
+    // its turn, so take a copy first and upload that (from our FileProvider).
+    fun uploadReceived(uri: Uri, mime: String) {
+        chatScope.launch {
+            val copy = withContext(Dispatchers.IO) { copyIntoCache(context, uri, mime) }
+            if (copy == null) client.localNotice(buffer, "Couldn't read that image.") else uploadIntoDraft(copy)
+        }
+    }
+    // A GIF from the keyboard, or an image pasted in. Send its link (GIPHY links
+    // tidied to the direct .gif) or upload the file, per the user's setting; fall
+    // back to whichever is possible. Uploading needs a Lurker server.
+    fun receiveRichContent(uri: Uri?, link: String?, mime: String) {
+        val cleanLink = link?.let { giphyDirectGif(it) ?: it }
+        val canUpload = uri != null && client.serverFeatures
+        when {
+            Ui.gifUpload && canUpload -> uploadReceived(uri!!, mime)
+            cleanLink != null -> insertIntoDraft(cleanLink)
+            canUpload -> uploadReceived(uri!!, mime)
+            else -> client.localNotice(
+                buffer,
+                "That image came without a link to share, and uploading needs a Lurker server.",
+            )
         }
     }
     // Tap a reply's quote: go to the line it answers, and flash it.
@@ -3002,6 +3067,8 @@ private fun ChatScreen(
                     return TextFieldValue(newText, TextRange(before.length + insert.length))
                 }
                 Composer(
+                    field = draftField.state,
+                    onRichContent = ::receiveRichContent,
                     draft = draft,
                     onChange = { new ->
                         val hadText = draft.text.isNotBlank()
@@ -4198,6 +4265,49 @@ private fun CompactMessageRow(
     }
 }
 
+/**
+ * The composer's text, held in a [TextFieldState] (the text field that can take
+ * GIFs from a keyboard) and read/written as a [TextFieldValue] through `by`, so
+ * the chat screen's draft edits work as before. A write that changes nothing is
+ * skipped: re-setting the same text mid-typing would break the keyboard's
+ * composing word.
+ */
+private class DraftField(val state: TextFieldState) {
+    /** What the app itself last wrote, so typing can be told from it. */
+    var lastSetText: String? = null
+
+    operator fun getValue(thisRef: Any?, property: KProperty<*>): TextFieldValue =
+        TextFieldValue(state.text.toString(), state.selection)
+
+    operator fun setValue(thisRef: Any?, property: KProperty<*>, value: TextFieldValue) {
+        val text = value.text
+        val sel = TextRange(value.selection.start.coerceIn(0, text.length), value.selection.end.coerceIn(0, text.length))
+        if (state.text.toString() == text && state.selection == sel) return
+        lastSetText = text
+        state.edit {
+            replace(0, length, text)
+            selection = sel
+        }
+    }
+}
+
+/** Copy received content into cache/camera (a FileProvider path) and return
+ *  that uri, or null if it can't be read. Off the main thread. */
+private fun copyIntoCache(context: android.content.Context, uri: Uri, mime: String): Uri? = runCatching {
+    val ext = when (mime.lowercase()) {
+        "image/gif" -> "gif"
+        "image/png" -> "png"
+        "image/webp" -> "webp"
+        "image/jpeg" -> "jpg"
+        else -> "img"
+    }
+    val dir = File(context.cacheDir, "camera").apply { mkdirs() }
+    val out = File(dir, "paste_${System.currentTimeMillis()}.$ext")
+    context.contentResolver.openInputStream(uri)?.use { input -> out.outputStream().use { input.copyTo(it) } }
+        ?: return null
+    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", out)
+}.getOrNull()
+
 /** The six one-tap reactions on a message's action sheet. */
 private val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🎉")
 
@@ -5167,8 +5277,13 @@ private fun applyFormat(v: TextFieldValue, code: String, end: String = code): Te
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Composer(
+    /** The text field's state — the draft's source of truth. */
+    field: TextFieldState,
+    /** A GIF/image from the keyboard or clipboard: (content uri?, its web link?, mime). */
+    onRichContent: ((Uri?, String?, String) -> Unit)? = null,
     draft: TextFieldValue,
     onChange: (TextFieldValue) -> Unit,
     target: String,
@@ -5262,9 +5377,37 @@ private fun Composer(
                     fontSize = 15.sp,
                 )
             }
+            // Keyboards (Gboard's GIF search) and the clipboard hand images over
+            // as rich content. Take the first image; a pasted GIPHY page link is
+            // swapped for its direct .gif. Anything else is left to the field.
+            val receiver = remember(onRichContent) {
+                onRichContent?.let { handle ->
+                    ReceiveContentListener { content ->
+                        if (content.hasMediaType(MediaType.Image)) {
+                            val link = content.platformTransferableContent?.linkUri?.toString()
+                            val mime = content.clipMetadata.clipDescription
+                                .let { d -> (0 until d.mimeTypeCount).map(d::getMimeType).firstOrNull { it.startsWith("image/") } }
+                                ?: "image/*"
+                            var taken = false
+                            content.consume { item ->
+                                val uri = item.uri
+                                if (uri != null && !taken) {
+                                    taken = true
+                                    handle(uri, link, mime)
+                                    true
+                                } else false
+                            }
+                        } else {
+                            val clip = content.clipEntry.clipData
+                            val pasted = if (clip.itemCount == 1) clip.getItemAt(0).text?.toString()?.trim() else null
+                            val gif = pasted?.takeIf { ' ' !in it }?.let(::giphyDirectGif)
+                            if (gif != null) { handle(null, gif, "text/plain"); null } else content
+                        }
+                    }
+                }
+            }
             TextField(
-                value = draft,
-                onValueChange = onChange,
+                state = field,
                 placeholder = { Text("Message $target", color = TextSecondary) },
                 shape = RoundedCornerShape(22.dp),
                 colors = TextFieldDefaults.colors(
@@ -5274,9 +5417,10 @@ private fun Composer(
                     unfocusedIndicatorColor = Color.Transparent,
                     cursorColor = AccentBlue,
                 ),
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f)
+                    .then(if (receiver != null) Modifier.contentReceiver(receiver) else Modifier),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                onKeyboardAction = { onSend() },
             )
             val canSend = draft.text.isNotBlank()
             Box(
@@ -5537,6 +5681,15 @@ private fun SettingsScreen(client: LurkerClient, prefs: Prefs, onBack: () -> Uni
                 if (!ServerPreviews.enabled) {
                     item { InlineMediaCard(prefs) }
                     item { LinkPreviewsCard(prefs) }
+                    // Uploading needs a Lurker server; direct mode always sends links.
+                    if (client.serverFeatures) item {
+                        PrefToggleCard(
+                            title = "Upload keyboard GIFs",
+                            subtitle = "Off: GIFs from your keyboard (GIPHY, Tenor) are sent as a link. " +
+                                "On: the GIF itself is uploaded through your server.",
+                            checked = Ui.gifUpload,
+                        ) { Ui.gifUpload = it; prefs.gifUpload = it }
+                    }
                     item { YoutubeDescriptionsCard(prefs) }
                 }
                 item { TranslationCard(prefs) }

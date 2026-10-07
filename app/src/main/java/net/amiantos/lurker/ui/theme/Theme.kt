@@ -32,6 +32,8 @@ enum class AppTheme(val id: String, val label: String) {
 object Ui {
     var theme by mutableStateOf(AppTheme.Oled)
     var inlineMedia by mutableStateOf(true)
+    /** Keyboard GIFs: upload the file (true) or send the link (false). */
+    var gifUpload by mutableStateOf(false)
 
     /** Fetch OpenGraph preview cards for pasted (non-media) links. */
     var linkPreviews by mutableStateOf(true)

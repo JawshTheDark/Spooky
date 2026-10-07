@@ -25,7 +25,7 @@ import java.util.Base64
  */
 object OAuth {
     /** Shown as the app's website host on the approval page. */
-    const val CLIENT_URI = "https://github.com/JawshTheDark/lurker-android-upstream"
+    const val CLIENT_URI = "https://github.com/JawshTheDark/Spooky"
 
     /** Where the browser sends the member back. Lurker requires a reverse-DNS
      *  custom scheme (one with a dot), which both flavors' application ids are —

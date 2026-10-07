@@ -9,7 +9,7 @@ even without a Lurker server at all.
 > drive a native client has grown into a daily driver: signed-in persistence, resilient reconnect,
 > formatted chat, member lists, uploads, search, DCC, notifications, and a full second backend that
 > speaks raw IRC and bouncers. Actively used against production servers and the hosted app, and
-> released often — see [Releases](https://github.com/JawshTheDark/lurker-android-upstream/releases)
+> released often — see [Releases](https://github.com/JawshTheDark/Spooky/releases)
 > for the APK and the running changelog.
 
 ## Two ways to run it

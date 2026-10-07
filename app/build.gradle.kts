@@ -26,8 +26,8 @@ android {
         // the mainline API level — a Boox Palma is API 33. Nothing here needs 34.
         minSdk = 31
         targetSdk = 36
-        versionCode = 125
-        versionName = "0.11.0"
+        versionCode = 126
+        versionName = "0.11.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -42,8 +42,11 @@ android {
     productFlavors {
         create("full") {
             dimension = "distribution"
-            // Private daily-driver "Lurker" — name + blue icon come from src/main.
-            applicationId = "net.amiantos.lurker"
+            // The GitHub-release build, "Spooky (GitHub)" — name + blue icon come
+            // from src/main. Its own package: it used net.amiantos.lurker / "Lurker",
+            // which is now the OFFICIAL Lurker app on Play (amiantos/lurker-android),
+            // so the two couldn't be installed together and ours read as theirs.
+            applicationId = "chat.irc.lurker.full"
         }
         create("spooky") {
             dimension = "distribution"

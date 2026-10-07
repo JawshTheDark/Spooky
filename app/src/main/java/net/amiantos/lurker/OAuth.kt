@@ -29,7 +29,7 @@ object OAuth {
 
     /** Where the browser sends the member back. Lurker requires a reverse-DNS
      *  custom scheme (one with a dot), which both flavors' application ids are —
-     *  `chat.irc.lurker:/oauth`, `net.amiantos.lurker:/oauth` — so the two
+     *  `chat.irc.lurker:/oauth`, `chat.irc.lurker.full:/oauth` — so the two
      *  installs never intercept each other's redirects. */
     fun redirectUri(appId: String): String = "$appId:/oauth"
 

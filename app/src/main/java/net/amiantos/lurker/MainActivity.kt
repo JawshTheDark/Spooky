@@ -219,6 +219,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.key
+import androidx.compose.ui.res.stringResource
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
@@ -727,9 +728,14 @@ class MainActivity : FragmentActivity() {
      * session token's prefs file included) to the user's upload host and paste
      * the public link into the composer. Accept only another app's content URI.
      */
-    private fun isShareableUri(uri: Uri): Boolean =
-        uri.scheme.equals("content", ignoreCase = true) &&
-            uri.authority?.startsWith(packageName) != true
+    private fun isShareableUri(uri: Uri): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val authority = uri.authority ?: return false
+        // Owned by THIS app? (Not a name-prefix test: chat.irc.lurker is a prefix
+        // of chat.irc.lurker.full, the other Spooky build's package.)
+        val owner = runCatching { packageManager.resolveContentProvider(authority, 0)?.packageName }.getOrNull()
+        return owner != packageName
+    }
 
     private fun consumeShareIntent(intent: Intent?) {
         if (intent?.action == Intent.ACTION_SEND) {
@@ -855,7 +861,7 @@ class MainActivity : FragmentActivity() {
             },
         )
         val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Unlock Lurker")
+            .setTitle("Unlock ${getString(R.string.app_name)}")
             .setSubtitle("Confirm it's you to open your chats")
             .setAllowedAuthenticators(authenticators)
             .build()
@@ -1333,7 +1339,7 @@ private fun LockScreen(onUnlock: () -> Unit, e2e: Boolean = false) {
             LockGlyph(color = if (e2e) OnlineGreen else TextSecondary, size = 44.dp)
             Spacer(Modifier.height(16.dp))
             Text(
-                if (e2e) "Encrypted channel locked" else "Lurker is locked",
+                if (e2e) "Encrypted channel locked" else "${stringResource(R.string.app_name)} is locked",
                 color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
             )
             Spacer(Modifier.height(20.dp))

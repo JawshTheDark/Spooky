@@ -81,7 +81,7 @@ Pick the mode on first launch; it can be switched later from Settings.
 
 One codebase, two identities (Gradle product flavors):
 
-- **`full`** — `net.amiantos.lurker`, "Lurker" — the private daily-driver / sideload build.
+- **`full`** — `chat.irc.lurker.full`, "Spooky (GitHub)" — the sideload build attached to GitHub releases. (It was `net.amiantos.lurker` / "Lurker" until 0.11.1; that package is now the official Lurker app, so it moved.)
 - **`spooky`** — `chat.irc.lurker`, "Spooky for Lurker" — the public Play Store build.
 
 Fork-only surfaces (custom aliases, DCC send/chat, fserve) are gated at **runtime** on the connected

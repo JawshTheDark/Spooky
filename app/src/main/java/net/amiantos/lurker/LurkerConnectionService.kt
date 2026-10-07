@@ -48,7 +48,7 @@ class LurkerConnectionService : Service() {
         )
         val notif = NotificationCompat.Builder(this, Notifier.CHANNEL_SERVICE)
             .setSmallIcon(R.drawable.ic_stat_notification)
-            // Flavor-aware name: "Spooky for Lurker" on the Spooky build, not "Lurker".
+            // Flavor-aware name: "Spooky for Lurker" (Play) or "Spooky (GitHub)".
             .setContentTitle("${getString(R.string.app_name)} is staying connected")
             .setContentText("Highlights and DMs will notify you in the background.")
             .setContentIntent(open)

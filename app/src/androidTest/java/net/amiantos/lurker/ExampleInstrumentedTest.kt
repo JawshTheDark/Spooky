@@ -19,6 +19,7 @@ class ExampleInstrumentedTest {
     fun useAppContext() {
         // Context of the app under test.
         val appContext = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("net.amiantos.lurker", appContext.packageName)
+        // chat.irc.lurker (Play) or chat.irc.lurker.full (GitHub release).
+        assertTrue(appContext.packageName.startsWith("chat.irc.lurker"))
     }
 }

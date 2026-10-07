@@ -53,6 +53,28 @@ fun giphyDirectGif(url: String): String? {
     return "https://media.giphy.com/media/$id/giphy.gif"
 }
 
+/**
+ * The links of a message that is NOTHING but links (formatting codes aside), or
+ * null when there's any other text. A `<bracketed>` link is the poster asking not
+ * to unfurl it, so it never counts.
+ */
+fun linkOnlyUrls(text: String): List<String>? {
+    val plain = Mirc.strip(text).trim()
+    if (plain.isEmpty()) return null
+    val tokens = plain.split(Regex("\\s+"))
+    return tokens.takeIf { t -> t.all { it.startsWith("https://", true) || it.startsWith("http://", true) } }
+}
+
+/**
+ * Whether a link-only message is fully shown by its on-device image embeds
+ * (direct mode): every link an image or GIF, within the per-message embed cap.
+ * Then the picture stands in for the link. Video and audio keep their link.
+ */
+fun localImagesCoverText(text: String, limit: Int = 3): Boolean {
+    val links = linkOnlyUrls(text)?.distinct() ?: return false
+    return links.size <= limit && links.all { mediaKindForUrl(it) == MediaKind.IMAGE }
+}
+
 /** The media URLs in a message body, capped so one paste can't flood a bubble. */
 fun mediaUrlsIn(text: String, limit: Int = 3): List<Pair<String, MediaKind>> =
     Mirc.urls(text).mapNotNull { u -> mediaKindForUrl(u)?.let { u to it } }.take(limit)

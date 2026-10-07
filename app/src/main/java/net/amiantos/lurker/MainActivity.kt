@@ -4070,6 +4070,14 @@ private fun MessageBubble(
         msg.replyTo?.let { r ->
             ReplyQuote(r, baseSize, onJumpTo, Modifier.padding(horizontal = 6.dp).padding(bottom = 2.dp))
         }
+        // A message that's only a GIF/image link, shown as the picture: the
+        // picture stands in for the link, so the bubble with the raw URL is left
+        // out (long-press moves to the picture).
+        val serverCovers = onLink != null && ServerPreviews.enabled && serverImagesCoverText(msg)
+        val localCovers = onLink != null && !ServerPreviews.enabled && Ui.inlineMedia &&
+            remember(msg.text) { localImagesCoverText(msg.text) }
+        val mediaOnly = msg.type != "error" && (serverCovers || localCovers)
+        val mediaLongPress = onAction?.let { a -> { a(msg) } }
         // A message fully painted with one mIRC background becomes a bubble of
         // that color instead of colored stripes inside a gray bubble.
         val paintedBg = remember(msg.text) { Mirc.wholeMessageBg(msg.text)?.let { Color(it) } }
@@ -4078,7 +4086,7 @@ private fun MessageBubble(
         // messages or a fully mIRC-painted one.
         val goldHighlight = !self && paintedBg == null && (msg.matched || flash)
         val highlightBg = if (Ui.highlightColor != 0) Color(Ui.highlightColor) else HighlightGold
-        Box(
+        if (!mediaOnly) Box(
             Modifier
                 .clip(shape)
                 .background(
@@ -4152,7 +4160,7 @@ private fun MessageBubble(
                 when (kind) {
                     MediaKind.AUDIO -> InlineAudioPlayer(url)
                     MediaKind.VIDEO -> InlineVideoPlayer(url)
-                    MediaKind.IMAGE -> MediaEmbed(url, onOpen = { onLink(url) }, onLoaded = onMediaLoaded)
+                    MediaKind.IMAGE -> MediaEmbed(url, onOpen = { onLink(url) }, onLoaded = onMediaLoaded, onLongPress = mediaLongPress)
                 }
             }
         }
@@ -4161,7 +4169,7 @@ private fun MessageBubble(
         // linked host). Direct-IRC mode has no server, so it keeps the on-device
         // scraper — see ServerPreview.kt for why that distinction matters.
         if (onLink != null) {
-            if (ServerPreviews.enabled) ServerPreviewCards(msg, onLink)
+            if (ServerPreviews.enabled) ServerPreviewCards(msg, onLink, mediaLongPress)
             else LinkPreviewCards(msg.text, onLink)
         }
         ReactionChips(reactions, onReact, alignEnd = self, modifier = Modifier.padding(top = 3.dp))
@@ -4207,6 +4215,13 @@ private fun CompactMessageRow(
     val body = remember(shown, accent, onLink != null, onChannel != null) {
         mircAnnotated(shown, accent, onLink, onChannel)
     }
+    // Only a GIF/image link, shown as the picture below: keep "time nick", drop
+    // the raw URL. Long-press moves to the picture.
+    val serverCovers = onLink != null && ServerPreviews.enabled && serverImagesCoverText(msg)
+    val localCovers = onLink != null && !ServerPreviews.enabled && Ui.inlineMedia &&
+        remember(msg.text) { localImagesCoverText(msg.text) }
+    val mediaOnly = msg.type != "error" && (serverCovers || localCovers)
+    val mediaLongPress = onAction?.let { a -> { a(msg) } }
     val line = buildAnnotatedString {
         if (time != null) {
             withStyle(SpanStyle(color = TextSecondary, fontSize = (baseSize - 4).sp)) { append("$time ") }
@@ -4225,9 +4240,10 @@ private fun CompactMessageRow(
         if (badge.isNotEmpty()) {
             withStyle(SpanStyle(color = AccentBlue, fontSize = (baseSize - 4).sp)) { append(badge) }
         }
-        when (msg.type) {
-            "error" -> withStyle(SpanStyle(color = AlertRed)) { append(body) }
-            "notice" -> withStyle(SpanStyle(color = NoticeAmber)) { append(body) }
+        when {
+            msg.type == "error" -> withStyle(SpanStyle(color = AlertRed)) { append(body) }
+            mediaOnly -> {}
+            msg.type == "notice" -> withStyle(SpanStyle(color = NoticeAmber)) { append(body) }
             else -> append(body)
         }
     }
@@ -4250,7 +4266,7 @@ private fun CompactMessageRow(
                 when (kind) {
                     MediaKind.AUDIO -> InlineAudioPlayer(url)
                     MediaKind.VIDEO -> InlineVideoPlayer(url)
-                    MediaKind.IMAGE -> MediaEmbed(url, onOpen = { onLink(url) }, onLoaded = onMediaLoaded)
+                    MediaKind.IMAGE -> MediaEmbed(url, onOpen = { onLink(url) }, onLoaded = onMediaLoaded, onLongPress = mediaLongPress)
                 }
             }
         }
@@ -4258,7 +4274,7 @@ private fun CompactMessageRow(
         // linked host). Direct-IRC mode has no server, so it keeps the on-device
         // scraper — see ServerPreview.kt for why that distinction matters.
         if (onLink != null) {
-            if (ServerPreviews.enabled) ServerPreviewCards(msg, onLink)
+            if (ServerPreviews.enabled) ServerPreviewCards(msg, onLink, mediaLongPress)
             else LinkPreviewCards(msg.text, onLink)
         }
         ReactionChips(reactions, onReact, alignEnd = false, modifier = Modifier.padding(top = 2.dp, bottom = 1.dp))
@@ -4780,7 +4796,7 @@ private fun rememberEmbedLoader(): coil.ImageLoader {
  * load-older anchoring stable despite the size change.
  */
 @Composable
-private fun MediaEmbed(url: String, onOpen: () -> Unit, onLoaded: () -> Unit = {}) {
+private fun MediaEmbed(url: String, onOpen: () -> Unit, onLoaded: () -> Unit = {}, onLongPress: (() -> Unit)? = null) {
     // Real aspect once known; a landscape default reserves sane space first.
     var ratio by remember(url) { mutableStateOf<Float?>(null) }
     BoxWithConstraints(Modifier.padding(top = 6.dp).fillMaxWidth()) {
@@ -4792,7 +4808,7 @@ private fun MediaEmbed(url: String, onOpen: () -> Unit, onLoaded: () -> Unit = {
                 .clip(RoundedCornerShape(12.dp))
                 .background(CanvasBlack)
                 .border(0.5.dp, GlassBorder, RoundedCornerShape(12.dp))
-                .clickable(onClick = onOpen),
+                .combinedClickable(onClick = onOpen, onLongClick = onLongPress),
             contentAlignment = Alignment.Center,
         ) {
             AsyncImage(

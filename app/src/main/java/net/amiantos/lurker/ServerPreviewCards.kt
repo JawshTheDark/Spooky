@@ -6,6 +6,7 @@ package net.amiantos.lurker
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -116,8 +117,35 @@ fun ServerPreviewPump(client: LurkerClient) {
  * changes a row's height, and revealing three of them 200ms apart makes the
  * reader watch the layout rearrange three times.
  */
+/**
+ * Whether [msg] is only links and the server resolved every one of them to an
+ * image this client draws — then the picture stands in for the link and the text
+ * bubble is left out. False until the answers settle, so the link shows first
+ * and is replaced, never the other way round; anything not an image (a page
+ * card, a video, audio) keeps its link.
+ */
 @Composable
-fun ServerPreviewCards(msg: Msg, onOpen: (String) -> Unit) {
+fun serverImagesCoverText(msg: Msg): Boolean {
+    val client = ServerPreviews.client ?: return false
+    if (!ServerPreviews.enabled || !previewableEvent(msg.type)) return false
+    val links = remember(msg.text) { linkOnlyUrls(msg.text)?.toSet() } ?: return false
+    val inlineMedia = client.settingBool("chat.inline_media.enabled", false)
+    if (!inlineMedia) return false
+    val cards = client.settingBool("chat.link_previews.enabled", false)
+    val urls = remember(msg.text, inlineMedia, cards) { serverPreviewUrls(msg.text, inlineMedia, cards) }
+    // Every link must be one we preview (not cut by the per-message budget).
+    if (urls.toSet() != links) return false
+    @Suppress("UNUSED_EXPRESSION") ServerPreviews.revision
+    if (!ServerPreviews.store.settled(urls)) return false
+    return urls.all { u ->
+        ServerPreviews.store.get(u)?.let { it.kind == "image" && it.isAllowed(inlineMedia, cards) } == true
+    }
+}
+
+/** [onLongPress]: the message's action sheet, for when the picture IS the
+ *  message (see [serverImagesCoverText]) and there's no bubble to press. */
+@Composable
+fun ServerPreviewCards(msg: Msg, onOpen: (String) -> Unit, onLongPress: (() -> Unit)? = null) {
     val client = ServerPreviews.client ?: return
     if (!ServerPreviews.enabled) return
     if (!previewableEvent(msg.type)) return
@@ -144,7 +172,7 @@ fun ServerPreviewCards(msg: Msg, onOpen: (String) -> Unit) {
     val others = resolved.filter { it.kind != "image" }
 
     Column(Modifier.fillMaxWidth()) {
-        if (images.isNotEmpty()) ImageGrid(client, images, onOpen)
+        if (images.isNotEmpty()) ImageGrid(client, images, onOpen, onLongPress)
         others.forEach { p ->
             when (p.kind) {
                 "video-embed" -> EmbedFacade(client, p, onOpen)
@@ -205,7 +233,12 @@ private fun ByteImage(
  *  known from the COUNT alone — nothing reads an image's real dimensions, so
  *  nothing reflows when the bytes land. */
 @Composable
-private fun ImageGrid(client: LurkerClient, images: List<ServerLinkPreview>, onOpen: (String) -> Unit) {
+private fun ImageGrid(
+    client: LurkerClient,
+    images: List<ServerLinkPreview>,
+    onOpen: (String) -> Unit,
+    onLongPress: (() -> Unit)? = null,
+) {
     val rows = images.chunked(2)
     Column(Modifier.fillMaxWidth().padding(top = 6.dp)) {
         rows.forEach { row ->
@@ -218,7 +251,7 @@ private fun ImageGrid(client: LurkerClient, images: List<ServerLinkPreview>, onO
                             .clip(RoundedCornerShape(12.dp))
                             .background(CanvasBlack)
                             .border(0.5.dp, GlassBorder, RoundedCornerShape(12.dp))
-                            .clickable { onOpen(p.url) },
+                            .combinedClickable(onClick = { onOpen(p.url) }, onLongClick = onLongPress),
                     ) {
                         ByteImage(client, p.src, Modifier.fillMaxSize())
                     }

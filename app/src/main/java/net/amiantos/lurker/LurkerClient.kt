@@ -362,8 +362,8 @@ open class LurkerClient {
      */
     val reactions = mutableStateMapOf<Long, List<Reaction>>()
 
-    /** networkId -> whether a reaction can go out there right now (`canReact`). */
-    val networkCanReact = mutableStateMapOf<Int, Boolean>()
+    /** networkId -> which IRCv3 client tags (reactions, replies) go out there now. */
+    val networkTags = mutableStateMapOf<Int, TagSupport>()
 
     /** bufferKey -> the reply that buffer's composer is writing (draft-synced). */
     val draftReplies = mutableStateMapOf<String, DraftReply>()
@@ -655,7 +655,7 @@ open class LurkerClient {
             dccChatsLive.clear()
             dccChatOffers.clear()
             reactions.clear()
-            networkCanReact.clear()
+            networkTags.clear()
             serverHasReactions = false
             draftReplies.clear()
             maxStaticImageDimension = 0
@@ -1359,7 +1359,7 @@ open class LurkerClient {
                 when (frame.optString("type")) {
                     // Whether reactions can be sent on this network changed (2.4+).
                     "react-support" -> {
-                        if (networkId != null) networkCanReact[networkId] = frame.optBoolean("canReact", false)
+                        if (networkId != null) TagSupport.parse(frame)?.let { networkTags[networkId] = it }
                         return
                     }
                     "dcc-chat-offer", "dcc-chat-offer-closed", "dcc-chat-state" -> {
@@ -1969,8 +1969,9 @@ open class LurkerClient {
             }
             // Whether a reaction can go out here (Lurker 2.4+). Absent on a
             // disconnected network: treat as false.
-            networkCanReact[id] = n.optBoolean("canReact", false)
-            if (n.has("canReact")) serverHasReactions = true
+            val tags = TagSupport.parse(n)
+            networkTags[id] = tags ?: TagSupport.NONE
+            if (tags != null) serverHasReactions = true
             // DCC CHAT state rides every snapshot: replace this network's slice.
             n.optJSONArray("dccChats")?.let { live ->
                 dccChatsLive.removeAll { it.startsWith("$id::") }
@@ -3182,7 +3183,7 @@ open class LurkerClient {
      *  msgid, on a connected network that can send the tags, never E2E. */
     fun canReact(buffer: Buffer, msg: Msg): Boolean {
         val nid = buffer.networkId ?: return false
-        return serverFeatures && networkCanReact[nid] == true && networks[nid]?.connected == true &&
+        return serverFeatures && networkTags[nid]?.addReaction == true && networks[nid]?.connected == true &&
             msg.id > 0 && msg.msgid != null && (msg.type == "message" || msg.type == "action") &&
             !msg.e2e && buffer.key !in e2eSeen &&
             !buffer.isServerBuffer && !buffer.isDccChat
@@ -3192,6 +3193,9 @@ open class LurkerClient {
      *  Reply falls back to the plain "nick, " address. */
     fun canReplyTo(buffer: Buffer, msg: Msg): Boolean =
         serverFeatures && buffer.networkId != null && msg.id > 0 && msg.msgid != null &&
+            // canReply false: the network strips the tag, so a "reply" would go
+            // out as a plain line. Unknown (pre-2.4.3 server): offer it as before.
+            networkTags[buffer.networkId]?.reply != false &&
             msg.type in setOf("message", "action", "notice") &&
             !msg.e2e && buffer.key !in e2eSeen &&
             !buffer.isServerBuffer && !buffer.isDccChat
@@ -3199,15 +3203,21 @@ open class LurkerClient {
     /** React with [value] on a line, or take ours back if it's already there.
      *  Never optimistic: the server's `reaction` echo is what lights it up, and a
      *  refusal is silence. */
-    fun react(messageId: Long, value: String) {
+    fun react(networkId: Int, messageId: Long, value: String): ReactResult {
         val v = value.trim()
-        if (messageId <= 0 || !isValidReaction(v)) return
+        if (messageId <= 0 || !isValidReaction(v)) return ReactResult.INVALID
         val mine = reactions[messageId].orEmpty().any { it.self && it.value == v }
+        // Some networks take a reaction but not its removal (draft/unreact denied):
+        // the server would refuse, silently, so don't ask.
+        if (mine && networkTags[networkId]?.removeReaction != true) return ReactResult.CANT_REMOVE
         ws?.send(
             JSONObject().put("type", "react").put("messageId", messageId).put("value", v)
                 .put("remove", mine).toString(),
         )
+        return ReactResult.SENT
     }
+
+    enum class ReactResult { SENT, CANT_REMOVE, INVALID }
 
     private fun parseReactions(arr: JSONArray?): List<Reaction> {
         if (arr == null) return emptyList()

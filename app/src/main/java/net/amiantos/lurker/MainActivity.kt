@@ -2591,8 +2591,17 @@ private fun ChatScreen(
     // A line's reaction chips, and whether tapping one can send a reaction.
     fun reactionsOf(m: Msg): List<ReactionGroup> =
         if (m.id > 0 && buffer.networkId != null) groupReactions(client.reactions[m.id]) else emptyList()
-    fun reactOn(m: Msg): ((String) -> Unit)? =
-        if (client.canReact(buffer, m)) { v: String -> client.react(m.id, v) } else null
+    fun reactOn(m: Msg): ((String) -> Unit)? {
+        val nid = buffer.networkId ?: return null
+        if (!client.canReact(buffer, m)) return null
+        return { v: String ->
+            if (client.react(nid, m.id, v) == LurkerClient.ReactResult.CANT_REMOVE) {
+                android.widget.Toast.makeText(
+                    context, "This network doesn't let reactions be taken back.", android.widget.Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
     /**
      * Actually put the composer contents on the wire. Split out of the send
      * lambda so the outgoing-translation cycle can reach it: an already-in-

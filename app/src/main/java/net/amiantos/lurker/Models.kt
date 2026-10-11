@@ -155,6 +155,30 @@ data class ReplyParent(
     val self: Boolean,
 )
 
+/**
+ * What a network's IRC server lets IRCv3 client tags carry (Lurker 2.4.3+). A
+ * network can allow adding a reaction yet deny taking one back — irc.so's
+ * UnrealIRCd does — so each is its own answer. [reply] is null when the server
+ * predates `canReply` (then a reply is offered as before).
+ */
+data class TagSupport(val addReaction: Boolean, val removeReaction: Boolean, val reply: Boolean?) {
+    companion object {
+        val NONE = TagSupport(addReaction = false, removeReaction = false, reply = null)
+
+        /** Read the snapshot / `react-support` fields. A server before 2.4.3 sent
+         *  only `canReact`, which meant all of them; null when there's nothing. */
+        fun parse(o: org.json.JSONObject): TagSupport? {
+            if (!o.has("canReact") && !o.has("canAddReaction")) return null
+            val legacy = o.optBoolean("canReact", false)
+            return TagSupport(
+                addReaction = if (o.has("canAddReaction")) o.optBoolean("canAddReaction") else legacy,
+                removeReaction = if (o.has("canRemoveReaction")) o.optBoolean("canRemoveReaction") else legacy,
+                reply = if (o.has("canReply")) o.optBoolean("canReply") else null,
+            )
+        }
+    }
+}
+
 /** One IRCv3 reaction standing on a line (Lurker 2.4+). [self] is yours. */
 data class Reaction(val nick: String, val value: String, val self: Boolean)
 

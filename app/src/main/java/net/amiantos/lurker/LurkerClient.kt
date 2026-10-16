@@ -384,6 +384,29 @@ open class LurkerClient {
     var dccEnabled by mutableStateOf(true)
         private set
 
+    /** This account's DCC grants and limits (`GET /api/dcc/config`); null on a
+     *  server that predates per-feature grants, which falls back to the old
+     *  all-or-nothing switch. */
+    var dccConfig by mutableStateOf<DccConfig?>(null)
+        private set
+
+    /** Files the account keeps on the server (received, or uploaded to send). */
+    val dccFiles = mutableStateMapOf<Int, DccFile>()
+
+    /** DCC chat may be offered here. */
+    val dccCanChat: Boolean get() = dccConfig?.chat ?: serverFeatures
+    /** Incoming file offers may be accepted. */
+    val dccCanReceive: Boolean get() = dccConfig?.receive ?: dccEnabled
+    /** Files may be sent: upstream's grant, or the fork's own send route. */
+    val dccCanSend: Boolean get() = dccConfig?.send ?: serverExtended
+
+    /** Chunked, resumable uploads (`/api/upload-sessions`): the largest chunk,
+     *  and the largest file a session takes. 0 = the server has no sessions. */
+    var uploadChunkBytes by mutableStateOf(0L)
+        private set
+    var maxChunkedUploadBytes by mutableStateOf(0L)
+        private set
+
     // Search (WS) + highlights (REST). One monotonic token drops stale results.
     val searchResults = mutableStateListOf<SearchResult>()
     var searchLoading by mutableStateOf(false)
@@ -652,6 +675,10 @@ open class LurkerClient {
             pendingWhois.clear()
             failedSends.clear()
             transfers.clear()
+            dccFiles.clear()
+            dccConfig = null
+            uploadChunkBytes = 0
+            maxChunkedUploadBytes = 0
             dccChatsLive.clear()
             dccChatOffers.clear()
             reactions.clear()
@@ -1131,6 +1158,7 @@ open class LurkerClient {
                     status = null
                     backoffMs = INITIAL_BACKOFF
                     fetchServerConfig() // which optional features this instance has
+                    refreshDccConfig() // which DCC parts this account may use
                 }
             }
 
@@ -1248,6 +1276,8 @@ open class LurkerClient {
                 // upload unchecked exactly as before and let the 413 decide.
                 if (frame.has("maxUploadBytes")) maxUploadBytes = frame.optLong("maxUploadBytes")
                 maxStaticImageDimension = frame.optInt("maxStaticImageDimension", 0).coerceAtLeast(0)
+                uploadChunkBytes = frame.optLong("uploadChunkBytes", 0).coerceAtLeast(0)
+                maxChunkedUploadBytes = frame.optLong("maxChunkedUploadBytes", 0).coerceAtLeast(0)
             }
 
             // The burst's terminal frame. A fresh burst (reconnect, in-band resync,
@@ -1271,6 +1301,10 @@ open class LurkerClient {
                 if (frame.has("maxUploadBytes")) maxUploadBytes = frame.optLong("maxUploadBytes")
                 if (frame.has("maxStaticImageDimension")) {
                     maxStaticImageDimension = frame.optInt("maxStaticImageDimension", 0).coerceAtLeast(0)
+                }
+                if (frame.has("uploadChunkBytes")) uploadChunkBytes = frame.optLong("uploadChunkBytes", 0).coerceAtLeast(0)
+                if (frame.has("maxChunkedUploadBytes")) {
+                    maxChunkedUploadBytes = frame.optLong("maxChunkedUploadBytes", 0).coerceAtLeast(0)
                 }
             }
 
@@ -1653,6 +1687,12 @@ open class LurkerClient {
             }
 
             "dcc-transfer" -> frame.optJSONObject("transfer")?.let { applyTransfer(it) }
+            // Kept DCC files and list clears, from any device (Lurker after 2.4.3).
+            "dcc-file" -> frame.optJSONObject("file")?.let(DccFile::parse)?.let { dccFiles[it.id] = it }
+            "dcc-file-deleted" -> dccFiles.remove(frame.optInt("id", -1))
+            "dcc-transfers-cleared" -> frame.optJSONArray("ids")?.let { a ->
+                for (i in 0 until a.length()) transfers.remove(a.optInt(i, -1))
+            }
 
             "send-result" -> {
                 val clientId = frame.optString("clientId")
@@ -2881,9 +2921,26 @@ open class LurkerClient {
      * local/…) and hand back its public URL. Multipart field is `image` for
      * historical reasons — any file type goes through it.
      */
-    fun uploadFile(filename: String, fileBody: okhttp3.RequestBody, onDone: (String?, String?) -> Unit) {
+    fun uploadFile(
+        filename: String,
+        fileBody: okhttp3.RequestBody,
+        source: UploadSource? = null,
+        onDone: (String?, String?) -> Unit,
+    ) {
         post { uploading = true }
         io.execute {
+            // Bigger than one chunk, on a server with sessions: send it in pieces
+            // that survive a dropped connection (and get past a proxy's request
+            // cap). A file that fits in one chunk gains nothing — one request.
+            if (source != null && uploadChunkBytes > 0 && source.size > uploadChunkBytes) {
+                try {
+                    val url = uploadViaSession("upload", filename, source).optString("url")
+                    post { uploading = false; onDone(url.ifEmpty { null }, if (url.isEmpty()) "upload failed" else null) }
+                } catch (e: Exception) {
+                    post { uploading = false; onDone(null, "upload failed: ${e.message}") }
+                }
+                return@execute
+            }
             try {
                 val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("image", filename, fileBody)
@@ -3020,6 +3077,16 @@ open class LurkerClient {
     // ---- DCC (receive) ----------------------------------------------------
 
     fun loadDcc() = io.execute {
+        // Per-feature grants on a newer Lurker. A 404 is an older server: the
+        // list's own 403 (below) still decides, as it always did.
+        val cfg = runCatching {
+            rest.newCall(authed("/api/dcc/config").build()).execute().use { res ->
+                if (!res.isSuccessful) null
+                else runCatching { DccConfig.parse(JSONObject(res.body?.string().orEmpty())) }.getOrNull()
+            }
+        }.getOrNull()
+        post { dccConfig = cfg }
+        if (cfg != null && (cfg.receive || cfg.send)) loadDccFilesNow()
         try {
             rest.newCall(authed("/api/dcc?limit=100").build()).execute().use { res ->
                 if (res.code == 403) {
@@ -3065,12 +3132,246 @@ open class LurkerClient {
         }
     }
 
+    /** Learn this account's DCC grants (newer Lurker), so the chat and send
+     *  actions show only where they'd work. Leaves [dccConfig] null on a server
+     *  without the route — then the old rules apply. */
+    fun refreshDccConfig() = io.execute {
+        // No feature check: the /api/config answer may not have landed yet, and
+        // an older server just answers 404 here.
+        val cfg = runCatching {
+            rest.newCall(authed("/api/dcc/config").build()).execute().use { res ->
+                if (!res.isSuccessful) null
+                else runCatching { DccConfig.parse(JSONObject(res.body?.string().orEmpty())) }.getOrNull()
+            }
+        }.getOrNull()
+        post { dccConfig = cfg }
+    }
+
+    /** GET /api/dcc/files — the account's kept files. Blocking; io thread. */
+    private fun loadDccFilesNow() {
+        runCatching {
+            rest.newCall(authed("/api/dcc/files").build()).execute().use { res ->
+                if (!res.isSuccessful) return
+                val arr = JSONObject(res.body?.string().orEmpty()).optJSONArray("files") ?: return
+                val files = (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(DccFile::parse) }
+                post { dccFiles.clear(); files.forEach { dccFiles[it.id] = it } }
+            }
+        }
+    }
+
+    /** A DCC REST call whose JSON answer is handed to [ok]; any refusal lands in
+     *  [dccError] with the server's own reason. */
+    private fun dccCall(what: String, req: Request, ok: (JSONObject, Int) -> Unit) = io.execute {
+        try {
+            rest.newCall(req).execute().use { res ->
+                val text = res.body?.string().orEmpty()
+                val body = runCatching { JSONObject(text) }.getOrNull() ?: JSONObject()
+                if (!res.isSuccessful && res.code != 409) {
+                    post { dccError = body.optString("error").ifEmpty { "$what failed (HTTP ${res.code})" } }
+                    return@execute
+                }
+                post { ok(body, res.code) }
+            }
+        } catch (e: Exception) {
+            post { dccError = "$what failed: ${e.message}" }
+        }
+    }
+
+    /** Clear a finished transfer from the list (its kept file stays). One still
+     *  holding a partial asks first: [onPartial] fires, and calling again with
+     *  [deletePartial] deletes the partial with it. */
+    fun dccClear(id: Int, deletePartial: Boolean = false, onPartial: () -> Unit = {}) =
+        dccCall("Clear", authed("/api/dcc/$id" + if (deletePartial) "?partial=delete" else "").delete().build()) { b, code ->
+            when {
+                code == 409 && b.optBoolean("partial") -> onPartial()
+                code == 409 -> dccError = b.optString("error").ifEmpty { "Couldn't clear that transfer." }
+                else -> {
+                    transfers.remove(id)
+                    b.optJSONArray("ids")?.let { a -> for (i in 0 until a.length()) transfers.remove(a.optInt(i)) }
+                }
+            }
+        }
+
+    /** Clear every finished transfer (except ones holding a partial). */
+    fun dccClearFinished() =
+        dccCall("Clear", authed("/api/dcc/clear").post(ByteArray(0).toRequestBody(null)).build()) { b, _ ->
+            b.optJSONArray("ids")?.let { a -> for (i in 0 until a.length()) transfers.remove(a.optInt(i)) }
+        }
+
+    /** Delete a finished transfer's file from the server; the row stays. */
+    fun dccDeleteTransferFile(id: Int) =
+        dccCall("Delete", authed("/api/dcc/$id/file").delete().build()) { b, code ->
+            if (code == 409) dccError = b.optString("error").ifEmpty { "Cancel the transfer first." }
+            else b.optJSONObject("transfer")?.let { applyTransfer(it) }
+        }
+
+    /** Delete one of the account's kept files. */
+    fun dccDeleteFile(fileId: Int) =
+        dccCall("Delete", authed("/api/dcc/files/$fileId").delete().build()) { b, code ->
+            if (code == 409) dccError = b.optString("error").ifEmpty { "That file is being sent." }
+            else dccFiles.remove(fileId)
+        }
+
+    /** Offer one of the account's kept files to [nick] (upstream DCC SEND). */
+    fun dccSendKeptFile(networkId: Int, nick: String, fileId: Int, passive: Boolean = false) {
+        val body = JSONObject().put("networkId", networkId).put("nick", nick).put("fileId", fileId)
+            .apply { if (passive) put("passive", true) }.toString().toRequestBody(json)
+        dccCall("DCC send", authed("/api/dcc/send").post(body).build()) { b, code ->
+            if (code == 409) dccError = b.optString("error").ifEmpty { "Couldn't send that file." }
+            else b.optJSONObject("transfer")?.let { dccError = null; applyTransfer(it) }
+        }
+    }
+
+    /** Byte path for a kept file / a completed transfer's file, for downloads. */
+    fun dccFilePath(fileId: Int) = "/api/dcc/files/$fileId/file"
+    fun dccTransferFilePath(id: Int) = "/api/dcc/$id/file"
+
+    // ---- Chunked uploads (/api/upload-sessions) -------------------------------
+
+    /** Something an upload session can read from more than once (a retry starts
+     *  where the server got to, so it reopens and skips ahead). */
+    class UploadSource(val size: Long, val mime: String?, val open: () -> java.io.InputStream?)
+
+    private class UploadFailed(msg: String) : Exception(msg)
+
+    /**
+     * Send [src] through an upload session for [purpose] ("upload" or "dcc-send")
+     * and return what completing it answered. Resumes after a dropped chunk from
+     * the server's offset, and waits out a completion that outlasts the request.
+     * Blocking; io thread.
+     */
+    private fun uploadViaSession(purpose: String, filename: String, src: UploadSource): JSONObject {
+        fun err(text: String, code: Int) =
+            runCatching { JSONObject(text).optString("error") }.getOrNull()?.ifEmpty { null } ?: "HTTP $code"
+        val create = JSONObject().put("purpose", purpose).put("size", src.size).put("filename", filename)
+            .apply { src.mime?.let { put("mime", it) } }.toString().toRequestBody(json)
+        val session = rest.newCall(authed("/api/upload-sessions").post(create).build()).execute().use { res ->
+            val text = res.body?.string().orEmpty()
+            if (!res.isSuccessful) throw UploadFailed(err(text, res.code))
+            JSONObject(text)
+        }
+        val id = session.optString("id")
+        val chunk = session.optLong("chunkBytes", uploadChunkBytes).coerceAtLeast(64L * 1024)
+        var offset = session.optLong("offset", 0)
+        var failures = 0
+        var stream: java.io.InputStream? = null
+        var streamPos = -1L
+        fun sessionOffset(): Long? = runCatching {
+            rest.newCall(authed("/api/upload-sessions/$id").build()).execute().use { r ->
+                if (r.isSuccessful) JSONObject(r.body?.string().orEmpty()).optLong("offset") else null
+            }
+        }.getOrNull()
+        try {
+            while (offset < src.size) {
+                try {
+                    if (stream == null || streamPos != offset) {
+                        stream?.close()
+                        stream = src.open() ?: throw UploadFailed("The file can no longer be read.")
+                        var skipped = 0L
+                        while (skipped < offset) {
+                            val n = stream!!.skip(offset - skipped)
+                            if (n <= 0) throw UploadFailed("The file changed while uploading.")
+                            skipped += n
+                        }
+                        streamPos = offset
+                    }
+                    val len = minOf(chunk, src.size - offset).toInt()
+                    val buf = ByteArray(len)
+                    var read = 0
+                    while (read < len) {
+                        val n = stream!!.read(buf, read, len - read)
+                        if (n < 0) throw UploadFailed("The file ended early.")
+                        read += n
+                    }
+                    streamPos += len
+                    val put = authed("/api/upload-sessions/$id")
+                        .header("Upload-Offset", offset.toString())
+                        .put(buf.toRequestBody("application/octet-stream".toMediaType()))
+                        .build()
+                    uploadHttp.newCall(put).execute().use { res ->
+                        val text = res.body?.string().orEmpty()
+                        val o = runCatching { JSONObject(text) }.getOrNull()
+                        when {
+                            res.isSuccessful -> { offset = o?.optLong("offset", offset + len) ?: (offset + len); failures = 0 }
+                            res.code == 413 || res.code == 404 -> throw UploadFailed(err(text, res.code))
+                            else -> {
+                                // 409 (offset/busy), 408, 429, 5xx: start again from the server's offset.
+                                if (++failures > 8) throw UploadFailed(err(text, res.code))
+                                offset = o?.takeIf { it.has("offset") }?.optLong("offset") ?: sessionOffset() ?: offset
+                                Thread.sleep(minOf(1_000L shl failures.coerceAtMost(4), 15_000L))
+                            }
+                        }
+                    }
+                } catch (e: java.io.IOException) {
+                    if (++failures > 8) throw UploadFailed(e.message ?: "connection lost")
+                    Thread.sleep(minOf(1_000L shl failures.coerceAtMost(4), 15_000L))
+                    offset = sessionOffset() ?: offset
+                }
+            }
+        } finally {
+            runCatching { stream?.close() }
+        }
+        // Complete. Its answer can outlast the request, so a lost or 409
+        // "processing" answer is read back from the session once it's done.
+        repeat(60) {
+            try {
+                uploadHttp.newCall(authed("/api/upload-sessions/$id/complete").post("{}".toRequestBody(json)).build())
+                    .execute().use { res ->
+                        val text = res.body?.string().orEmpty()
+                        if (res.isSuccessful) return JSONObject(text)
+                        // 409 = still processing; 408/429/5xx = try again.
+                        if (res.code !in setOf(408, 409, 429) && res.code < 500) throw UploadFailed(err(text, res.code))
+                    }
+            } catch (_: java.io.IOException) {
+            }
+            val done = runCatching {
+                rest.newCall(authed("/api/upload-sessions/$id").build()).execute().use { r ->
+                    JSONObject(r.body?.string().orEmpty())
+                }
+            }.getOrNull()
+            if (done?.optString("state") == "done") {
+                val result = done.optJSONObject("result")
+                val status = result?.optInt("status", 500) ?: 500
+                val body = result?.opt("body")
+                val obj = (body as? JSONObject) ?: runCatching { JSONObject(body.toString()) }.getOrNull() ?: JSONObject()
+                if (status in 200..299) return obj
+                throw UploadFailed(obj.optString("error").ifEmpty { "HTTP $status" })
+            }
+            Thread.sleep(2_000)
+        }
+        throw UploadFailed("The server is still processing the upload.")
+    }
+
     /**
      * Offer a file to [nick] over DCC SEND. Bytes go up as multipart; the server
      * stages them in its DCC dir and CTCP-offers the peer (active or passive per
      * server config + dcc.prefer_passive). Progress arrives as dcc-transfer frames.
      */
-    fun dccSendFile(networkId: Int, nick: String, filename: String, fileBody: okhttp3.RequestBody) = io.execute {
+    fun dccSendFile(
+        networkId: Int,
+        nick: String,
+        filename: String,
+        fileBody: okhttp3.RequestBody,
+        source: UploadSource? = null,
+    ) = io.execute {
+        // Upstream Lurker (after 2.4.3): upload into a dcc-send session, which
+        // keeps the file as one of the account's, then offer that file.
+        if (dccConfig?.send == true) {
+            if (source == null || source.size <= 0) {
+                post { dccError = "Couldn't read that file's size, so it can't be sent." }
+                return@execute
+            }
+            try {
+                val file = uploadViaSession("dcc-send", filename, source).optJSONObject("file")
+                    ?.let(DccFile::parse) ?: throw UploadFailed("The server didn't keep the file.")
+                post { dccFiles[file.id] = file }
+                dccSendKeptFile(networkId, nick, file.id)
+            } catch (e: Exception) {
+                post { dccError = "DCC send failed: ${e.message}" }
+            }
+            return@execute
+        }
+        // The fork's own route: the file goes up as multipart with the offer.
         try {
             val body = MultipartBody.Builder().setType(MultipartBody.FORM)
                 .addFormDataPart("networkId", networkId.toString())
@@ -3766,6 +4067,9 @@ open class LurkerClient {
             total = o.optLong("advertised_size", 0),
             direction = o.optString("direction", "recv"),
             error = o.optString("error").ifEmpty { null },
+            hasFile = !o.isNull("destination_path") && o.optString("destination_path").isNotEmpty() &&
+                (o.isNull("file_deleted_at") || o.optString("file_deleted_at").isEmpty()),
+            fileId = if (o.isNull("file_id")) null else o.optInt("file_id", -1).takeIf { it > 0 },
         )
     }
 

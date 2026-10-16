@@ -227,6 +227,77 @@ data class FailedSend(
 )
 
 
+/**
+ * What DCC this account may do (`GET /api/dcc/config`, Lurker after 2.4.3): each
+ * part — chat, receiving files, sending them — is an admin's grant. Limits come
+ * only when receive or send is granted. Null limit = none.
+ */
+data class DccConfig(
+    val chat: Boolean,
+    val receive: Boolean,
+    val send: Boolean,
+    val maxFileBytes: Long = 0,
+    val canListen: Boolean = true,
+    val usedBytes: Long = 0,
+    val limitBytes: Long? = null,
+) {
+    companion object {
+        fun parse(o: org.json.JSONObject) = DccConfig(
+            chat = o.optBoolean("chat", false),
+            receive = o.optBoolean("receive", false),
+            send = o.optBoolean("send", false),
+            maxFileBytes = o.optLong("maxFileBytes", 0),
+            canListen = o.optBoolean("canListen", true),
+            usedBytes = o.optLong("usedBytes", 0),
+            limitBytes = if (o.has("limitBytes") && !o.isNull("limitBytes")) o.optLong("limitBytes") else null,
+        )
+    }
+}
+
+/** A file the account keeps on the server: one it received over DCC, or one it
+ *  uploaded to send. Kept until deleted; it counts against the storage limit. */
+data class DccFile(
+    val id: Int,
+    val name: String,
+    val size: Long,
+    /** "received" or "uploaded". */
+    val origin: String,
+    val createdAt: String?,
+    val peerNick: String?,
+    val networkId: Int?,
+) {
+    companion object {
+        fun parse(o: org.json.JSONObject): DccFile? {
+            val id = o.optInt("id", -1)
+            if (id < 0) return null
+            return DccFile(
+                id = id,
+                name = o.optString("name", "file"),
+                size = o.optLong("size", 0),
+                origin = o.optString("origin", "received"),
+                createdAt = o.optString("created_at").ifEmpty { null },
+                peerNick = if (o.isNull("peer_nick")) null else o.optString("peer_nick").ifEmpty { null },
+                networkId = if (o.isNull("network_id")) null else o.optInt("network_id"),
+            )
+        }
+    }
+}
+
+/** A DCC offer goes to exactly one person: not a channel, not a STATUSMSG
+ *  channel target (`@#room`), not a list (`bob,#room`), not a server/host
+ *  broadcast mask (`$$*`). Mirrors Lurker's shared isSinglePeerTarget. */
+fun isSinglePeerTarget(target: String): Boolean {
+    if (target.isEmpty() || target.any { it == ',' || it.isWhitespace() || it.code < 0x20 }) return false
+    if (target.startsWith("$")) return false
+    var t = target
+    while (t.isNotEmpty()) {
+        if (Commands.isChannel(t)) return false
+        if (t[0] !in "~&@%+") break
+        t = t.substring(1)
+    }
+    return true
+}
+
 /** An inbound DCC file transfer, mirrored from the server's transfer rows. */
 data class DccTransfer(
     val id: Int,
@@ -237,7 +308,16 @@ data class DccTransfer(
     val total: Long,
     val direction: String,
     val error: String?,
+    /** The server still holds this transfer's file (a completed receive's kept
+     *  file, or a failed one's partial). Its path is never shown. */
+    val hasFile: Boolean = false,
+    /** The kept DCC file a completed receive produced, or the one a send sends. */
+    val fileId: Int? = null,
 ) {
+    /** Done one way or another — something the list can be cleared of. */
+    val isFinished: Boolean get() = isTerminal
+    val isCompleted: Boolean get() = state == "completed"
+
     val progress: Float
         get() = if (total > 0) (received.toFloat() / total).coerceIn(0f, 1f) else 0f
     val isPending: Boolean get() = state == "pending_approval"
@@ -245,7 +325,7 @@ data class DccTransfer(
     val isActive: Boolean
         get() = state in setOf(
             "connecting", "receiving", "stalled", "verifying", "requested",
-            "offering", "sending", // outgoing-send states
+            "offering", "offered", "sending", // outgoing-send states (fork, upstream)
         )
     val isTerminal: Boolean
         get() = state in setOf("completed", "failed", "rejected", "cancelled")

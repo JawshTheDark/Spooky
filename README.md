@@ -61,7 +61,8 @@ Pick the mode on first launch; it can be switched later from Settings.
   offered the join.
 - **Composer.** Formatting toolbar + colour picker, tab-completion for nicks and commands, typing
   indicators, swipe-to-reply, and image/file uploads (plus Android share-sheet targets). Oversized
-  files are refused up front against the ceiling the server advertises, rather than after the upload.
+  files are refused up front against the ceiling the server advertises, rather than after the upload;
+  on a server with upload sessions, big files go up in resumable chunks.
 - **Nothing sent is lost.** A message that can't go out — offline, mid-reconnect, rejected, or
   unacknowledged — is kept in place with **Resend / Edit / Discard** instead of vanishing.
 - **Slash-commands.** `/me`, `/msg`, `/query`, `/join`, `/part`, `/nick`, `/topic`, `/kick`, `/mode`,
@@ -72,7 +73,9 @@ Pick the mode on first launch; it can be switched later from Settings.
 - **Search & contacts.** Server-side message search, highlights, and bookmarks. Friends carry
   multiple per-network identities and show presence on each — green online, yellow away, red
   offline, grey unknown.
-- **DCC.** Receive **and** send file transfers, plus DCC chat, with live progress.
+- **DCC.** Receive **and** send file transfers, plus DCC chat, with live progress. On a newer Lurker
+  it follows the account's per-feature grants, and kept files can be saved to the phone, sent on, or
+  deleted.
 - **Settings.** A registry-driven editor over the server's settings surface — every advertised
   setting is editable by type — alongside device-local app preferences. Includes an in-app
   diagnostics log (connection + error history) to paste into a bug report.

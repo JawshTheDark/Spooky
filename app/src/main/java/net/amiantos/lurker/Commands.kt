@@ -60,7 +60,7 @@ object Commands {
     /** A usable DCC chat peer: a bare nick — not a `=buffer` name, not a channel
      *  (which would broadcast the offer to the whole room). */
     private fun dccNick(raw: String?): String? =
-        raw?.trim()?.takeIf { it.isNotEmpty() && !isDccChat(it) && !isChannel(it) }
+        raw?.trim()?.takeIf { it.isNotEmpty() && !isDccChat(it) && isSinglePeerTarget(it) }
 
     /**
      * `/dcc`, following irssi's syntax exactly as the web client does:

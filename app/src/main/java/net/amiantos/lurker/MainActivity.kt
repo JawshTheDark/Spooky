@@ -632,6 +632,7 @@ class MainActivity : FragmentActivity() {
                             },
                             onBrowse = { q -> go(Screen.ChannelList(q)) },
                             onSettings = { client.loadSettings(); go(Screen.Settings) },
+                            onDcc = { client.loadDcc(); go(Screen.Dcc) },
                         )
                     }
                     Screen.Settings -> SettingsScreen(client, prefs) { back() }
@@ -928,18 +929,9 @@ private fun TabletHome(
     showRoster: Boolean,
 ) {
     val context = LocalContext.current
-    // DCC send from the roster pane: hold the target across the system picker.
-    var dccNick by remember { mutableStateOf<String?>(null) }
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        val nick = dccNick
-        dccNick = null
-        val networkId = selectedBuffer?.networkId
-        if (uri != null && nick != null && networkId != null) {
-            val upload = readUpload(context, uri)
-            if (upload == null) client.dccError = "Couldn't read that file."
-            else client.dccSendFile(networkId, nick, upload.first, upload.second, uploadSourceFor(context, uri))
-        }
-    }
+    // DCC send from the roster pane: a kept file, or one picked from the phone.
+    var dccSendTo by remember { mutableStateOf<DccSendTarget?>(null) }
+    dccSendTo?.let { t -> DccSendPicker(client, t) { dccSendTo = null } }
     Row(Modifier.fillMaxSize().background(CanvasBlack)) {
         // Left rail (three-pane only) — the full buffer list, overflow menu and all.
         if (showList) {
@@ -974,6 +966,7 @@ private fun TabletHome(
                     onOpenBuffer = onSelect,
                     onBrowse = { onBrowse() },
                     onSettings = onSettings,
+                    onDcc = onDcc,
                     // Three-pane: the rail is the persistent nav, so no back arrow.
                     // Two-pane: show the back arrow (Back returns to the list).
                     embedded = showList,
@@ -994,7 +987,9 @@ private fun TabletHome(
                     client = client,
                     buffer = selectedBuffer,
                     onOpenBuffer = onSelect,
-                    onPickFileFor = { nick -> dccNick = nick; filePicker.launch("*/*") },
+                    onPickFileFor = { nick, secure ->
+                        selectedBuffer?.networkId?.let { dccSendTo = DccSendTarget(it, nick, secure) }
+                    },
                 )
             }
         }
@@ -1603,6 +1598,7 @@ private fun BufferListScreen(
                 hazeState = hazeState,
                 onOpen = onOpen,
                 onOpenMultichan = onOpenMultichan,
+                onOpenDcc = onDcc,
             )
         }
 
@@ -1649,7 +1645,12 @@ private fun BufferListScreen(
                         DropdownMenuItem(text = { Text("Networks") }, onClick = { menuOpen = false; onNetworks() })
                         DropdownMenuItem(text = { Text("Settings") }, onClick = { menuOpen = false; onSettings() })
                         if (client.serverFeatures) {
-                            DropdownMenuItem(text = { Text("DCC transfers") }, onClick = { menuOpen = false; onDcc() })
+                            // The warning colour while an offer waits on an answer (as the web's DCC button).
+                            val offers = client.transfers.values.count { it.isPending && !it.isSend } + client.dccChatOffers.size
+                            DropdownMenuItem(
+                                text = { Text(if (offers > 0) "DCC — $offers waiting" else "DCC", color = if (offers > 0) NoticeAmber else Color.Unspecified) },
+                                onClick = { menuOpen = false; onDcc() },
+                            )
                         }
                         DropdownMenuItem(text = { Text("Sign out") }, onClick = { menuOpen = false; onSignOut() })
                     }
@@ -1668,6 +1669,7 @@ private fun BufferListBody(
     hazeState: HazeState,
     onOpen: (Buffer) -> Unit,
     onOpenMultichan: () -> Unit = {},
+    onOpenDcc: () -> Unit = {},
 ) {
     LazyColumn(
         // Clip the scroll viewport above the nav bar (padding, not just
@@ -1691,8 +1693,12 @@ private fun BufferListBody(
                     )
                 }
             }
-            if (client.serverFeatures && client.dccChatOffers.isNotEmpty()) {
-                item { DccChatBanner(client, current = null) }
+            if (client.serverFeatures && (
+                    client.dccChatOffers.isNotEmpty() ||
+                        client.transfers.values.any { it.isPending && !it.isSend && it.id !in client.dccOffersLater }
+                    )
+            ) {
+                item { DccBanner(client, current = null, onOpenDcc = onOpenDcc) }
             }
             // The Multi-channel firehose: a single pinned entry above every network
             // that merges the timelines of all toggled channels. Shown only once at
@@ -2152,6 +2158,8 @@ private fun ChatScreen(
     onBrowse: (String?) -> Unit = {},
     // Opens Settings from the top-bar gear.
     onSettings: () -> Unit = {},
+    // Opens the DCC screen (/dcc, an offer's "Open DCC").
+    onDcc: () -> Unit = {},
     // The middle pane of the tablet layout: the buffer list is a persistent rail,
     // so this hides the back arrow and yields the back gesture to the host.
     embedded: Boolean = false,
@@ -2209,6 +2217,17 @@ private fun ChatScreen(
     // The quote carries the context, so a DM needs no "nick, " — a channel still
     // gets one so the line reads as addressed to them.
     fun replyTo(m: Msg) {
+        // Under a quote a reply tag would land on the quote line, so it's the
+        // plain address in the answer instead.
+        val (quotes, answer) = Quote.split(draft.text)
+        if (quotes.isNotEmpty()) {
+            if (buffer.isChannel && !m.self && !answer.startsWith("${m.nick}, ")) {
+                val t = quotes + "${m.nick}, " + answer
+                draft = TextFieldValue(t, TextRange(t.length))
+                client.setDraftLocal(buffer, t)
+            }
+            return
+        }
         if (!client.canReplyTo(buffer, m)) { addressNick(m); return }
         val addressed = buffer.isChannel && !m.self && !draft.text.startsWith("${m.nick}, ")
         if (addressed) addressNick(m)
@@ -2362,21 +2381,9 @@ private fun ChatScreen(
         uploadIntoDraft(uri)
     }
 
-    // DCC send: remember who we're sending to across the system file picker.
-    var dccNick by remember { mutableStateOf<String?>(null) }
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        val nick = dccNick
-        dccNick = null
-        val networkId = buffer.networkId
-        if (uri != null && nick != null && networkId != null) {
-            val upload = readUpload(context, uri)
-            if (upload == null) {
-                client.dccError = "Couldn't read that file."
-            } else {
-                client.dccSendFile(networkId, nick, upload.first, upload.second, uploadSourceFor(context, uri))
-            }
-        }
-    }
+    // DCC send: who it goes to, while a kept file or one from the phone is picked.
+    var dccSendTo by remember { mutableStateOf<DccSendTarget?>(null) }
+    dccSendTo?.let { t -> DccSendPicker(client, t) { dccSendTo = null } }
 
     // hasMoreOlder doubles as the server's "unhydrated shell" marker (it ships
     // true on a buffer whose backlog hasn't been fetched yet), so it stays true on
@@ -2608,6 +2615,81 @@ private fun ChatScreen(
             }
         }
     }
+    // `/dcc …`: transfer verbs act on an id (the DCC screen shows them) across the
+    // account; chat and send ride this buffer's network. Results land here.
+    fun runDcc(cmd: DccCommand) {
+        fun note(text: String) = client.localNotice(buffer, text)
+        if (!client.serverFeatures) return note("DCC needs a Lurker server.")
+        val nid = buffer.networkId
+        val needsNetwork = "A DCC chat or send rides a network — use it from one of that network's buffers."
+        when (cmd) {
+            DccCommand.List -> onDcc()
+            DccCommand.Files -> {
+                val files = client.dccFiles.values.sortedByDescending { it.id }
+                note(
+                    if (files.isEmpty()) "No kept DCC files."
+                    else "Kept files (send one with /dcc send <nick> <id>):\n" +
+                        files.joinToString("\n") { "#${it.id}  ${it.name}  ${humanBytes(it.size)}" },
+                )
+            }
+            is DccCommand.ById -> {
+                val t = client.transfers[cmd.id] ?: return note("No transfer #${cmd.id}. /dcc list shows them.")
+                when (cmd.verb) {
+                    "accept" -> client.dccAccept(cmd.id, buffer)
+                    "reject" -> client.dccReject(cmd.id, buffer)
+                    "cancel" -> client.dccCancel(cmd.id, buffer)
+                    "retry" -> client.dccRetry(cmd.id, buffer)
+                    "delete" -> client.dccDeleteTransferFile(cmd.id, buffer)
+                    "download" ->
+                        if (!t.isCompleted || t.isSend || !t.hasFile) note("Transfer #${cmd.id} has no received file to download.")
+                        else ServerDownloads.save(context, client, client.dccTransferFilePath(cmd.id), t.filename)
+                }
+            }
+            is DccCommand.Clear ->
+                if (cmd.id == null) client.dccClearFinished()
+                else client.dccClear(cmd.id, report = buffer, onPartial = {
+                    note("Transfer #${cmd.id} still holds a partial download. Clear it from the DCC screen, which asks before deleting it.")
+                })
+            is DccCommand.Chat ->
+                if (nid == null) note(needsNetwork)
+                else client.dccChat(
+                    nid, cmd.nick, open = true, passive = cmd.passive, secure = cmd.secure,
+                    reportTo = buffer, focus = true,
+                )
+            is DccCommand.ChatClose ->
+                if (nid == null) note(needsNetwork) else client.dccChat(nid, cmd.nick, open = false, reportTo = buffer)
+            is DccCommand.Send -> {
+                if (nid == null) return note(needsNetwork)
+                if (!client.dccCanSend) return note("Sending DCC files isn't turned on for this account.")
+                val name = cmd.file ?: run {
+                    dccSendTo = DccSendTarget(nid, cmd.nick, secure = cmd.secure, passive = cmd.passive)
+                    return
+                }
+                if (client.dccConfig?.send != true) return note("This server doesn't keep files to send by name. Pick one: /dcc send ${cmd.nick}")
+                val f = DccCommands.findFile(client.dccFiles.values, name)
+                    ?: return note("No kept file matches \"$name\". /dcc files lists them.")
+                client.dccSendKeptFile(nid, cmd.nick, f.id, passive = cmd.passive, secure = cmd.secure, report = buffer)
+                note("Offering ${f.name} to ${cmd.nick}" + (if (cmd.secure) " (secure)…" else "…"))
+            }
+            is DccCommand.Error -> note(cmd.message)
+        }
+    }
+    // `/xdcc …`: the server-side XDCC queue (Lurker 2.5).
+    fun runXdcc(cmd: XdccCommand) {
+        fun note(text: String) = client.localNotice(buffer, text)
+        if (!client.serverFeatures || client.dccConfig == null) {
+            return note("The XDCC queue needs Lurker 2.5 or newer. A bot still takes a direct ask: /msg <bot> xdcc send #<pack>")
+        }
+        val nid = buffer.networkId ?: return note("The XDCC queue rides a network — use it from one of that network's buffers.")
+        when (cmd) {
+            is XdccCommand.Add ->
+                if (!client.dccCanReceive) note("Receiving DCC files isn't turned on for this account.")
+                else client.xdccQueue(nid, cmd.bot, cmd.packs, buffer)
+            is XdccCommand.Remove -> client.xdccRemove(nid, cmd.bot, cmd.packs, buffer)
+            is XdccCommand.Queue -> note(DccCommands.queueText(client.transfers.values, nid, cmd.bot))
+            is XdccCommand.Error -> note(cmd.message)
+        }
+    }
     /**
      * Actually put the composer contents on the wire. Split out of the send
      * lambda so the outgoing-translation cycle can reach it: an already-in-
@@ -2651,18 +2733,8 @@ private fun ChatScreen(
             }
             // Local command output (/help and friends) is id-less too.
             is ParsedInput.Local -> { client.localNotice(buffer, parsed.message); repinToTail() }
-            is ParsedInput.DccChat -> {
-                val networkId = buffer.networkId
-                if (!client.serverFeatures || networkId == null) {
-                    client.localNotice(buffer, "DCC chat needs a Lurker server.")
-                } else {
-                    client.dccChat(
-                        networkId, parsed.nick, open = !parsed.close, passive = parsed.passive,
-                        reportTo = buffer, focus = !parsed.close,
-                    )
-                }
-                repinToTail()
-            }
+            is ParsedInput.Dcc -> { runDcc(parsed.cmd); repinToTail() }
+            is ParsedInput.Xdcc -> { runXdcc(parsed.cmd); repinToTail() }
             is ParsedInput.Browse ->
                 // Lurker has a rich channel browser; direct mode falls back
                 // to a raw LIST (results land in the server buffer).
@@ -2930,6 +3002,11 @@ private fun ChatScreen(
                                 LockGlyph(color = OnlineGreen, size = 13.dp)
                                 Spacer(Modifier.width(4.dp))
                             }
+                            // A secure DCC chat (TLS) shows a lock while it's up.
+                            if (buffer.isDccChat && client.isDccChatLive(buffer) && client.isDccChatSecure(buffer)) {
+                                LockGlyph(color = AccentBlue, size = 13.dp)
+                                Spacer(Modifier.width(4.dp))
+                            }
                             Text(
                                 buffer.displayName,
                                 color = TextPrimary,
@@ -2967,9 +3044,42 @@ private fun ChatScreen(
                                     text = { Text(if (live) "End DCC chat" else "Start DCC chat again", color = AccentBlue) },
                                     onClick = {
                                         titleMenu = false
-                                        client.dccChat(dccNet, buffer.peer, open = !live, reportTo = buffer)
+                                        // A secure chat isn't re-offered in the clear.
+                                        client.dccChat(
+                                            dccNet, buffer.peer, open = !live, reportTo = buffer,
+                                            secure = !live && client.isDccChatSecure(buffer),
+                                        )
                                     },
                                 )
+                            }
+                            // A DM's DCC entries, as the web's DM menu has them (Lurker 2.5).
+                            if (!buffer.isChannel && !buffer.isDccChat && dccNet != null && client.serverFeatures) {
+                                if (client.dccCanSend) {
+                                    DropdownMenuItem(
+                                        text = { Text("Send a file (DCC)…", color = AccentBlue) },
+                                        onClick = { titleMenu = false; dccSendTo = DccSendTarget(dccNet, buffer.target) },
+                                    )
+                                    if (client.dccConfig?.send == true) DropdownMenuItem(
+                                        text = { Text("Secure send a file (DCC)…", color = AccentBlue) },
+                                        onClick = { titleMenu = false; dccSendTo = DccSendTarget(dccNet, buffer.target, secure = true) },
+                                    )
+                                }
+                                if (client.dccCanChat) {
+                                    DropdownMenuItem(
+                                        text = { Text("Chat (DCC)", color = AccentBlue) },
+                                        onClick = {
+                                            titleMenu = false
+                                            client.dccChat(dccNet, buffer.target, open = true, reportTo = buffer, focus = true)
+                                        },
+                                    )
+                                    if (client.dccConfig?.chat == true) DropdownMenuItem(
+                                        text = { Text("Secure chat (DCC)", color = AccentBlue) },
+                                        onClick = {
+                                            titleMenu = false
+                                            client.dccChat(dccNet, buffer.target, open = true, reportTo = buffer, focus = true, secure = true)
+                                        },
+                                    )
+                                }
                             }
                             DropdownMenuItem(
                                 text = {
@@ -3012,7 +3122,18 @@ private fun ChatScreen(
             )
             // Pending DCC chat offers, and this `=nick` chat's own connection state.
             // Inside the measured top column so the list's padding follows it.
-            if (client.serverFeatures) DccChatBanner(client, current = buffer)
+            if (client.serverFeatures) DccBanner(client, current = buffer, onOpenDcc = onDcc)
+            // Lines Lurker is still spacing out so the server doesn't kick for
+            // flooding (2.5): a long paste goes out paced.
+            val waitingLines = buffer.networkId?.let { client.sendQueueWaiting[it] } ?: 0
+            if (waitingLines > 0) {
+                Text(
+                    if (waitingLines == 1) "1 line waiting to send" else "$waitingLines lines waiting to send",
+                    color = TextSecondary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 2.dp),
+                )
+            }
         }
 
         // Channel control panel — tap the channel name pill to slide it out.
@@ -3244,10 +3365,9 @@ private fun ChatScreen(
             buffer = buffer,
             onDismiss = { showMembers = false },
             onOpenBuffer = { showMembers = false; onOpenBuffer(it) },
-            onPickFileFor = { nick ->
-                dccNick = nick
+            onPickFileFor = { nick, secure ->
                 showMembers = false
-                filePicker.launch("*/*")
+                buffer.networkId?.let { dccSendTo = DccSendTarget(it, nick, secure) }
             },
         )
     }
@@ -3279,9 +3399,19 @@ private fun ChatScreen(
                 actionMsg = null
             },
             onQuote = {
-                val t = "> ${m.text}\n" + draft.text
-                draft = TextFieldValue(t, TextRange(t.length))
-                client.setDraftLocal(buffer, t)
+                // A /command under a quote line would go out as channel text.
+                val body = Quote.split(draft.text).second
+                if (body.startsWith("/") && !body.startsWith("//")) {
+                    android.widget.Toast.makeText(
+                        context, "Clear the /command first — a quote above it would send it as text.", android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                } else {
+                    // One message carries one reply tag, and it would ride the quote line.
+                    cancelReply()
+                    val t = Quote.intoDraft(draft.text, Quote.lineFor(m.nick, m.type, m.text))
+                    draft = TextFieldValue(t, TextRange(t.length))
+                    client.setDraftLocal(buffer, t)
+                }
                 actionMsg = null
             },
             onWhois = if (buffer.networkId != null) {
@@ -3384,7 +3514,7 @@ private fun MemberSheet(
     buffer: Buffer,
     onDismiss: () -> Unit,
     onOpenBuffer: (Buffer) -> Unit,
-    onPickFileFor: (String) -> Unit,
+    onPickFileFor: (nick: String, secure: Boolean) -> Unit,
 ) {
     var selected by remember { mutableStateOf<Member?>(null) }
     ModalBottomSheet(
@@ -3488,7 +3618,7 @@ private fun MemberPane(
     client: LurkerClient,
     buffer: Buffer,
     onOpenBuffer: (Buffer) -> Unit,
-    onPickFileFor: (String) -> Unit,
+    onPickFileFor: (nick: String, secure: Boolean) -> Unit,
 ) {
     var selected by remember(buffer.key) { mutableStateOf<Member?>(null) }
     val roster = remember(client.members[buffer.key]) {
@@ -3543,7 +3673,7 @@ private fun MemberActions(
     onBack: () -> Unit,
     onDone: () -> Unit,
     onOpenBuffer: (Buffer) -> Unit,
-    onPickFileFor: (String) -> Unit,
+    onPickFileFor: (nick: String, secure: Boolean) -> Unit,
 ) {
     val networkId = buffer.networkId ?: return
     val nick = member.nick
@@ -3630,13 +3760,19 @@ private fun MemberActions(
         }
         // DCC SEND: upstream's grant (newer Lurker) or the fork's own route.
         if (client.dccCanSend) {
-            SheetAction("DCC: send a file…") { onPickFileFor(nick) }
+            SheetAction("DCC: send a file…") { onPickFileFor(nick, false) }
+            // Secure DCC (KVIrc's SSEND, over TLS) came with Lurker 2.5's grants.
+            if (client.dccConfig?.send == true) SheetAction("DCC: secure send a file…") { onPickFileFor(nick, true) }
         }
         // DCC CHAT: on a newer Lurker only when this account has the chat grant;
         // an older one answers 403 with a clear reason.
         if (client.serverFeatures && client.dccCanChat) {
             SheetAction("DCC: start a chat") {
                 client.dccChat(networkId, nick, open = true, focus = true)
+                onDone()
+            }
+            if (client.dccConfig?.chat == true) SheetAction("DCC: start a secure chat") {
+                client.dccChat(networkId, nick, open = true, focus = true, secure = true)
                 onDone()
             }
         }
@@ -3819,7 +3955,7 @@ internal fun uploadTooLarge(sizeBytes: Long, maxUploadBytes: Long): String? {
 /** Size, type and a way to reopen a picked file — what a chunked upload needs
  *  to send it in pieces and pick up where it left off. Null when the provider
  *  won't say how big it is. */
-private fun uploadSourceFor(context: android.content.Context, uri: Uri): LurkerClient.UploadSource? {
+internal fun uploadSourceFor(context: android.content.Context, uri: Uri): LurkerClient.UploadSource? {
     if (!uri.scheme.equals("content", ignoreCase = true)) return null
     var size = -1L
     runCatching {
@@ -3835,7 +3971,7 @@ private fun uploadSourceFor(context: android.content.Context, uri: Uri): LurkerC
     return LurkerClient.UploadSource(size, mime) { context.contentResolver.openInputStream(uri) }
 }
 
-private fun readUpload(
+internal fun readUpload(
     context: android.content.Context,
     uri: android.net.Uri,
     /** The server's maxStaticImageDimension (Lurker 2.4+), or 0 to send as-is.
@@ -4151,8 +4287,9 @@ private fun MessageBubble(
             // previews below) keeps reading msg.text, so a translator can't
             // re-spell a URL out from under them.
             val shown = translation?.text ?: msg.text
-            val parsed = remember(shown, linkColor, onLink != null, onChannel != null) {
-                mircAnnotated(shown, linkColor, onLink, onChannel)
+            val quoteInk = if (self) Color.White.copy(alpha = 0.72f) else TextSecondary
+            val parsed = remember(shown, linkColor, onLink != null, onChannel != null, quoteInk) {
+                Quote.styled(mircAnnotated(shown, linkColor, onLink, onChannel), quoteInk, quoteInk)
             }
             // Badge INLINE, not in the group header: the header renders only on the
             // first message of a sender's run, so badging there left every
@@ -4246,8 +4383,9 @@ private fun CompactMessageRow(
     // Cache the regex-heavy mIRC parse so a ChatScreen recomposition doesn't
     // re-parse every visible compact row (the buildAnnotatedString assembly below
     // is cheap; the parse is not).
-    val body = remember(shown, accent, onLink != null, onChannel != null) {
-        mircAnnotated(shown, accent, onLink, onChannel)
+    val quoteInk = TextSecondary
+    val body = remember(shown, accent, onLink != null, onChannel != null, quoteInk) {
+        Quote.styled(mircAnnotated(shown, accent, onLink, onChannel), quoteInk, quoteInk)
     }
     // Only a GIF/image link, shown as the picture below: keep "time nick", drop
     // the raw URL. Long-press moves to the picture.
@@ -5216,6 +5354,20 @@ private fun SystemLine(msg: Msg, onJoin: ((String) -> Unit)? = null) {
                 else -> TextSecondary
             },
             modifier = Modifier.fillMaxWidth().padding(16.dp, 3.dp),
+        )
+        return
+    }
+    if (msg.type == "dcc") {
+        // What happened to a DCC transfer or the XDCC queue (Lurker 2.5): offered,
+        // received, failed, queued — a status line in the peer's DM, never unread.
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(color = AccentBlue, fontWeight = FontWeight.Bold)) { append("DCC  ") }
+                append(msg.text)
+            },
+            fontSize = 12.sp,
+            color = TextSecondary,
+            modifier = Modifier.fillMaxWidth().padding(24.dp, 4.dp),
         )
         return
     }
@@ -7683,410 +7835,6 @@ private fun FriendsScreen(client: LurkerClient, onOpenBuffer: (Buffer) -> Unit, 
             item { Spacer(Modifier.height(24.dp)) }
         }
     }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun DccScreen(client: LurkerClient, onOpenBuffer: (Buffer) -> Unit, onBack: () -> Unit) {
-    BackHandler(onBack = onBack)
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
-        containerColor = CanvasBlack,
-        topBar = {
-            CenterAlignedTopAppBar(
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = CanvasBlack),
-                navigationIcon = {
-                    TextButton(onClick = onBack) { Text("‹", color = AccentBlue, fontSize = 26.sp) }
-                },
-                title = { Text("DCC transfers", fontWeight = FontWeight.SemiBold) },
-            )
-        },
-    ) { padding ->
-        val cfg = client.dccConfig
-        val transfers = remember(client.transfers.toMap()) {
-            client.transfers.values.sortedByDescending { it.id }
-        }
-        val files = remember(client.dccFiles.toMap()) { client.dccFiles.values.sortedByDescending { it.id } }
-        // Off for this account: nothing to start, and nothing already here.
-        val nothingGranted = if (cfg != null) !cfg.chat && !cfg.receive && !cfg.send else !client.dccEnabled
-        if (nothingGranted && transfers.isEmpty() && files.isEmpty()) {
-            Box(Modifier.padding(padding).fillMaxSize(), Alignment.Center) {
-                Text(
-                    "DCC isn't turned on for this account. Your server's admin can grant it.",
-                    Modifier.padding(24.dp),
-                    textAlign = TextAlign.Center,
-                )
-            }
-            return@Scaffold
-        }
-        val context = LocalContext.current
-        // A transfer still holding a partial download asks before deleting it.
-        var askPartial by remember { mutableStateOf<Int?>(null) }
-        var sending by remember { mutableStateOf<DccFile?>(null) }
-        // Newer Lurker: files stay on the server and can be saved, cleared, sent.
-        val keeps = cfg != null
-        LazyColumn(Modifier.padding(padding).fillMaxSize()) {
-            client.dccError?.let { err ->
-                item { Text(err, color = AlertRed, modifier = Modifier.padding(16.dp)) }
-            }
-            if (cfg != null && (cfg.receive || cfg.send)) {
-                item {
-                    Text(
-                        "Storage: ${humanBytes(cfg.usedBytes)} used" +
-                            (cfg.limitBytes?.let { " of ${humanBytes(it)}" } ?: ""),
-                        color = TextSecondary,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-                    )
-                }
-            }
-            if (client.dccCanChat || client.dccCanSend) item { DccStartCard(client, onOpenBuffer) }
-            item {
-                Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("Transfers", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    if (keeps && transfers.any { it.isFinished }) {
-                        TextButton(onClick = { client.dccClearFinished() }) { Text("Clear finished", color = AccentBlue) }
-                    }
-                }
-            }
-            if (transfers.isEmpty()) {
-                item { Text("No transfers.", Modifier.padding(16.dp), color = TextSecondary) }
-            }
-            items(transfers.size) { i ->
-                val t = transfers[i]
-                TransferRow(
-                    client, t,
-                    canReceive = client.dccCanReceive,
-                    keeps = keeps,
-                    onSave = { ServerDownloads.save(context, client, client.dccTransferFilePath(t.id), t.filename) },
-                    onClear = { client.dccClear(t.id, onPartial = { askPartial = t.id }) },
-                )
-            }
-            if (files.isNotEmpty()) {
-                item {
-                    Text(
-                        "Your files",
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(start = 16.dp, top = 18.dp, bottom = 4.dp),
-                    )
-                }
-                items(files.size) { i ->
-                    val f = files[i]
-                    DccFileRow(
-                        f,
-                        networkName = f.networkId?.let { client.networkName(it) },
-                        onSave = { ServerDownloads.save(context, client, client.dccFilePath(f.id), f.name) },
-                        onSend = if (cfg?.send == true) ({ sending = f }) else null,
-                        onDelete = { client.dccDeleteFile(f.id) },
-                    )
-                }
-            }
-            item { Spacer(Modifier.height(24.dp)) }
-        }
-        askPartial?.let { id ->
-            AlertDialog(
-                onDismissRequest = { askPartial = null },
-                containerColor = SurfaceRaised,
-                title = { Text("Delete the partial download?", color = TextPrimary) },
-                text = { Text("This transfer still holds the part of the file that arrived. Clearing it deletes that too.", color = TextSecondary) },
-                confirmButton = {
-                    TextButton(onClick = { askPartial = null; client.dccClear(id, deletePartial = true) }) {
-                        Text("Delete", color = AlertRed, fontWeight = FontWeight.SemiBold)
-                    }
-                },
-                dismissButton = { TextButton(onClick = { askPartial = null }) { Text("Keep", color = TextSecondary) } },
-            )
-        }
-        sending?.let { f -> DccSendKeptDialog(client, f) { sending = null } }
-    }
-}
-
-/**
- * DCC CHAT prompts. Every pending inbound offer gets Accept / Decline — nothing is
- * dialled until the user says so (the server never auto-accepts). In a `=nick`
- * chat ([current]) whose session isn't live and has no offer pending, a strip says
- * so and offers to start it again, the way a DM says its peer is offline.
- */
-@Composable
-private fun DccChatBanner(client: LurkerClient, current: Buffer?) {
-    val offers = client.dccChatOffers.values.sortedBy { it.nick.lowercase() }
-    val currentNet = current?.networkId
-    val showDown = current != null && current.isDccChat && currentNet != null &&
-        !client.isDccChatLive(current) && client.dccOfferFor(current) == null
-    if (offers.isEmpty() && !showDown) return
-    Column(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        offers.forEach { offer ->
-            DccStrip(
-                text = "${offer.nick} wants to start a DCC chat" +
-                    (if (client.networks.size > 1) " (${client.networkName(offer.networkId)})" else "") +
-                    (if (offer.passive) " — they're firewalled, so the server will listen" else ""),
-                primary = "Accept",
-                onPrimary = {
-                    client.dccChat(offer.networkId, offer.nick, open = true, reportTo = current, focus = true)
-                },
-                secondary = "Decline",
-                onSecondary = { client.dccChat(offer.networkId, offer.nick, open = false, reportTo = current) },
-            )
-        }
-        if (showDown && current != null && currentNet != null) {
-            DccStrip(
-                text = "DCC chat with ${current.peer} is not connected.",
-                primary = "Start again",
-                onPrimary = { client.dccChat(currentNet, current.peer, open = true, reportTo = current) },
-            )
-        }
-    }
-}
-
-@Composable
-private fun DccStrip(
-    text: String,
-    primary: String,
-    onPrimary: () -> Unit,
-    secondary: String? = null,
-    onSecondary: () -> Unit = {},
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(SurfaceRaised, RoundedCornerShape(10.dp))
-            .border(0.5.dp, GlassBorder, RoundedCornerShape(10.dp))
-            .padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
-    ) {
-        Text(text, color = TextPrimary, fontSize = 13.sp, modifier = Modifier.weight(1f))
-        if (secondary != null) {
-            TextButton(onClick = onSecondary) { Text(secondary, color = TextSecondary, fontSize = 13.sp) }
-        }
-        TextButton(onClick = onPrimary) {
-            Text(primary, color = AccentBlue, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-        }
-    }
-}
-
-/** Start an outgoing DCC send or chat: pick a network, type a nick, go. */
-@Composable
-private fun DccStartCard(client: LurkerClient, onOpenBuffer: (Buffer) -> Unit) {
-    val context = LocalContext.current
-    var nick by remember { mutableStateOf("") }
-    val connected = client.networks.values.filter { it.connected }
-    var networkId by remember(connected.map { it.id }) {
-        mutableStateOf(connected.firstOrNull()?.id)
-    }
-    var netMenu by remember { mutableStateOf(false) }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        val id = networkId
-        val who = nick.trim()
-        if (uri != null && id != null && who.isNotEmpty()) {
-            val upload = readUpload(context, uri)
-            if (upload == null) {
-                client.dccError = "Couldn't read that file."
-            } else {
-                client.dccSendFile(id, who, upload.first, upload.second, uploadSourceFor(context, uri))
-            }
-        }
-    }
-
-    Surface(
-        color = SurfaceDark,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(0.5.dp, GlassBorder),
-        modifier = Modifier.fillMaxWidth().padding(16.dp, 8.dp),
-    ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(
-                when {
-                    client.dccCanSend && client.dccCanChat -> "Start a transfer or chat"
-                    client.dccCanSend -> "Send a file"
-                    else -> "Start a DCC chat"
-                },
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 15.sp,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Box {
-                    TextButton(onClick = { netMenu = true }) {
-                        Text(
-                            connected.firstOrNull { it.id == networkId }?.name ?: "No network",
-                            color = AccentBlue,
-                        )
-                    }
-                    AppDropdownMenu(expanded = netMenu, onDismissRequest = { netMenu = false }) {
-                        connected.forEach { n ->
-                            DropdownMenuItem(
-                                text = { Text(n.name) },
-                                onClick = { networkId = n.id; netMenu = false },
-                            )
-                        }
-                    }
-                }
-                TextField(
-                    value = nick,
-                    onValueChange = { nick = it },
-                    placeholder = { Text("nick", color = TextSecondary) },
-                    singleLine = true,
-                    shape = RoundedCornerShape(10.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = SurfaceRaised,
-                        unfocusedContainerColor = SurfaceRaised,
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent,
-                        cursorColor = AccentBlue,
-                    ),
-                    modifier = Modifier.weight(1f),
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                // DCC SEND: upstream's grant, or the fork's own route.
-                if (client.dccCanSend) Button(
-                    onClick = { picker.launch("*/*") },
-                    enabled = networkId != null && nick.isNotBlank(),
-                ) { Text("Send a file…") }
-                if (client.dccCanChat) TextButton(
-                    onClick = {
-                        val id = networkId ?: return@TextButton
-                        client.dccChat(id, nick.trim(), open = true, focus = true)
-                    },
-                    enabled = networkId != null && nick.isNotBlank(),
-                ) { Text("Start a chat") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TransferRow(
-    client: LurkerClient,
-    t: DccTransfer,
-    canReceive: Boolean = true,
-    /** Newer Lurker: finished transfers can be cleared and their files saved. */
-    keeps: Boolean = false,
-    onSave: () -> Unit = {},
-    onClear: () -> Unit = {},
-) {
-    Column(Modifier.fillMaxWidth().padding(16.dp, 10.dp)) {
-        Text(t.filename, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
-        Text(
-            "${if (t.isSend) "to" else "from"} ${t.peerNick} · ${dccStateLabel(t.state)}" + (t.error?.let { " · $it" } ?: ""),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.outline,
-        )
-        if (t.isActive && t.total > 0) {
-            Spacer(Modifier.height(4.dp))
-            LinearProgressIndicator(progress = { t.progress }, modifier = Modifier.fillMaxWidth())
-            Text(
-                "${humanBytes(t.received)} / ${humanBytes(t.total)}",
-                style = MaterialTheme.typography.labelSmall,
-            )
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (t.isPending) {
-                // Accepting needs the receive grant; turning it down never does.
-                if (canReceive) TextButton(onClick = { client.dccAccept(t.id) }) { Text("Accept") }
-                TextButton(onClick = { client.dccReject(t.id) }) { Text("Reject") }
-            } else if (t.isActive) {
-                TextButton(onClick = { client.dccCancel(t.id) }) { Text("Cancel") }
-            }
-            if (keeps && t.isCompleted && !t.isSend && t.hasFile) {
-                TextButton(onClick = onSave) { Text("Save to phone") }
-                TextButton(onClick = { client.dccDeleteTransferFile(t.id) }) { Text("Delete file", color = AlertRed) }
-            }
-            if (keeps && t.isFinished) TextButton(onClick = onClear) { Text("Clear", color = TextSecondary) }
-        }
-    }
-    HorizontalDivider()
-}
-
-/** A transfer state as people read it. */
-internal fun dccStateLabel(state: String): String = when (state) {
-    "pending_approval" -> "waiting for you"
-    "offered" -> "waiting for them"
-    "completed" -> "done"
-    else -> state.replace('_', ' ')
-}
-
-/** One of the account's kept DCC files: save it to the phone, send it on, or delete it. */
-@Composable
-private fun DccFileRow(f: DccFile, networkName: String?, onSave: () -> Unit, onSend: (() -> Unit)?, onDelete: () -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(16.dp, 8.dp)) {
-        Text(f.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
-        Text(
-            (if (f.origin == "uploaded") "uploaded" else "from ${f.peerNick ?: "someone"}" + (networkName?.let { " on $it" } ?: "")) +
-                " · ${humanBytes(f.size)}",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.outline,
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            TextButton(onClick = onSave) { Text("Save to phone") }
-            if (onSend != null) TextButton(onClick = onSend) { Text("Send…") }
-            TextButton(onClick = onDelete) { Text("Delete", color = AlertRed) }
-        }
-    }
-    HorizontalDivider()
-}
-
-/** Offer a kept file to someone: pick the network, type the nick. */
-@Composable
-private fun DccSendKeptDialog(client: LurkerClient, f: DccFile, onDone: () -> Unit) {
-    val connected = client.networks.values.filter { it.connected }
-    var networkId by remember { mutableStateOf(f.networkId?.takeIf { id -> connected.any { it.id == id } } ?: connected.firstOrNull()?.id) }
-    var nick by remember { mutableStateOf("") }
-    val ok = networkId != null && isSinglePeerTarget(nick.trim())
-    AlertDialog(
-        onDismissRequest = onDone,
-        containerColor = SurfaceRaised,
-        title = { Text("Send ${f.name}", color = TextPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (connected.size > 1) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        connected.forEach { n ->
-                            val on = n.id == networkId
-                            Text(
-                                n.name,
-                                color = if (on) Color.White else TextSecondary,
-                                fontSize = 13.sp,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(if (on) AccentBlue else PillGray, RoundedCornerShape(8.dp))
-                                    .clickable { networkId = n.id }
-                                    .padding(horizontal = 10.dp, vertical = 5.dp),
-                            )
-                        }
-                    }
-                }
-                if (connected.isEmpty()) Text("No network is connected.", color = AlertRed)
-                OutlinedTextField(
-                    value = nick,
-                    onValueChange = { nick = it },
-                    placeholder = { Text("nick") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(enabled = ok, onClick = {
-                networkId?.let { client.dccSendKeptFile(it, nick.trim(), f.id) }
-                onDone()
-            }) { Text("Send", color = if (ok) AccentBlue else TextSecondary, fontWeight = FontWeight.SemiBold) }
-        },
-        dismissButton = { TextButton(onClick = onDone) { Text("Cancel", color = TextSecondary) } },
-    )
-}
-
-private fun humanBytes(n: Long): String {
-    if (n < 1024) return "$n B"
-    val units = listOf("KB", "MB", "GB", "TB")
-    var value = n.toDouble() / 1024
-    var i = 0
-    while (value >= 1024 && i < units.lastIndex) {
-        value /= 1024; i++
-    }
-    return String.format("%.1f %s", value, units[i])
 }
 
 /**

@@ -172,13 +172,14 @@ class CommandsTest {
 
     @Test
     fun dccChatOffersToANick() {
-        assertEquals(ParsedInput.DccChat("bob", close = false, passive = false), dcc("/dcc chat bob"))
-        assertEquals(ParsedInput.DccChat("bob", close = false, passive = true), dcc("/dcc chat -passive bob"))
+        assertEquals(ParsedInput.Dcc(DccCommand.Chat("bob", passive = false, secure = false)), dcc("/dcc chat bob"))
+        assertEquals(ParsedInput.Dcc(DccCommand.Chat("bob", passive = true, secure = false)), dcc("/dcc chat -passive bob"))
+        assertEquals(ParsedInput.Dcc(DccCommand.Chat("bob", passive = false, secure = true)), dcc("/dcc chat -secure bob"))
     }
 
     @Test
     fun dccCloseIsTypeFirst() {
-        assertEquals(ParsedInput.DccChat("bob", close = true), dcc("/dcc close chat bob"))
+        assertEquals(ParsedInput.Dcc(DccCommand.ChatClose("bob")), dcc("/dcc close chat bob"))
         // The old shorthand would have closed a chat with a peer named "chat".
         assertTrue(dcc("/dcc close bob") is ParsedInput.Local)
         // Read literally this would OFFER a chat to "close".

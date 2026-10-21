@@ -353,6 +353,22 @@ open class LurkerClient {
      *  that quietly sends the peer a FRESH offer instead. */
     val dccChatOffers = mutableStateMapOf<String, DccChatOffer>()
 
+    /** "networkId::peerLower" of DCC chats over TLS (Lurker 2.5 SCHAT): live ones,
+     *  and ended ones too, so "Start again" offers the same kind rather than
+     *  carrying on in the clear. Seeded from each snapshot's `dccSecureChats`. */
+    val dccSecureChats = mutableStateSetOf<String>()
+
+    /** File offers the user put off ("Later"): out of the banner, still on the DCC screen. */
+    val dccOffersLater = mutableStateSetOf<Int>()
+
+    /** Lines still to go out, per network: Lurker 2.5 paces a burst so the server
+     *  doesn't kick for flooding. Shown as "N waiting". */
+    val sendQueueWaiting = mutableStateMapOf<Int, Int>()
+
+    /** Bytes a second for each moving transfer, smoothed — speed and time left. */
+    val transferRates = mutableStateMapOf<Int, Long>()
+    private val rateSamples = HashMap<Int, Pair<Long, Long>>()
+
     /**
      * IRCv3 reactions standing on each line we've seen, by message id (Lurker
      * 2.4+). Kept beside the rows rather than on them, as the web client does:
@@ -681,6 +697,11 @@ open class LurkerClient {
             maxChunkedUploadBytes = 0
             dccChatsLive.clear()
             dccChatOffers.clear()
+            dccSecureChats.clear()
+            dccOffersLater.clear()
+            sendQueueWaiting.clear()
+            transferRates.clear()
+            rateSamples.clear()
             reactions.clear()
             networkTags.clear()
             serverHasReactions = false
@@ -1158,7 +1179,7 @@ open class LurkerClient {
                     status = null
                     backoffMs = INITIAL_BACKOFF
                     fetchServerConfig() // which optional features this instance has
-                    refreshDccConfig() // which DCC parts this account may use
+                    loadDcc() // grants, offers waiting for an answer, kept files
                 }
             }
 
@@ -1394,6 +1415,11 @@ open class LurkerClient {
                     // Whether reactions can be sent on this network changed (2.4+).
                     "react-support" -> {
                         if (networkId != null) TagSupport.parse(frame)?.let { networkTags[networkId] = it }
+                        return
+                    }
+                    // Lines still to go out on this network, paced (2.5). Ephemeral.
+                    "send-queue" -> {
+                        if (networkId != null) sendQueueWaiting[networkId] = frame.optInt("waiting", 0).coerceAtLeast(0)
                         return
                     }
                     "dcc-chat-offer", "dcc-chat-offer-closed", "dcc-chat-state" -> {
@@ -1686,7 +1712,7 @@ open class LurkerClient {
                 chanlistRows.addAll(parsed.filter { it.channel !in known })
             }
 
-            "dcc-transfer" -> frame.optJSONObject("transfer")?.let { applyTransfer(it) }
+            "dcc-transfer" -> frame.optJSONObject("transfer")?.let { applyTransfer(it, live = true) }
             // Kept DCC files and list clears, from any device (Lurker after 2.4.3).
             "dcc-file" -> frame.optJSONObject("file")?.let(DccFile::parse)?.let { dccFiles[it.id] = it }
             "dcc-file-deleted" -> dccFiles.remove(frame.optInt("id", -1))
@@ -2011,6 +2037,7 @@ open class LurkerClient {
             // disconnected network: treat as false.
             val tags = TagSupport.parse(n)
             networkTags[id] = tags ?: TagSupport.NONE
+            sendQueueWaiting[id] = n.optInt("sendQueueWaiting", 0).coerceAtLeast(0)
             if (tags != null) serverHasReactions = true
             // DCC CHAT state rides every snapshot: replace this network's slice.
             n.optJSONArray("dccChats")?.let { live ->
@@ -2029,6 +2056,14 @@ open class LurkerClient {
                     val offer = DccChatOffer(id, nk, passive = false)
                     if (offer.key !in dccChatOffers) dccChatOffers[offer.key] = offer
                 }
+            }
+            // The live chats over TLS (2.5). A live chat it doesn't list runs in the
+            // clear; an ended one keeps its kind for "Start again".
+            n.optJSONArray("dccSecureChats")?.let { sec ->
+                val keys = (0 until sec.length()).map { sec.optString(it) }.filter { it.isNotEmpty() }
+                    .map { "$id::${it.lowercase()}" }.toSet()
+                dccSecureChats.removeAll { it.startsWith("$id::") && it in dccChatsLive && it !in keys }
+                dccSecureChats.addAll(keys)
             }
             // Per-network pinned buffers, in the user's chosen order.
             n.optJSONArray("pinned")?.let { p ->
@@ -2631,6 +2666,13 @@ open class LurkerClient {
                 system = true,
                 level = e.optString("level").ifEmpty { "info" },
             )
+            // What happened to a DCC transfer or the XDCC queue (Lurker 2.5), kept in
+            // the peer's DM. Never unread, never a notification.
+            "dcc" -> Msg(
+                id = id, type = "dcc", nick = "", text = text,
+                self = false, time = e.optString("time").ifEmpty { null },
+                system = true,
+            )
             // The :system: buffer's log lines (#355): type 'system', nick null,
             // with level/scope/source riding alongside.
             "system" -> Msg(
@@ -3109,18 +3151,22 @@ open class LurkerClient {
         }
     }
 
-    fun dccAccept(id: Int) = dccAction(id, "accept")
-    fun dccReject(id: Int) = dccAction(id, "reject")
-    fun dccCancel(id: Int) = dccAction(id, "cancel")
+    fun dccAccept(id: Int, report: Buffer? = null) = dccAction(id, "accept", report)
+    fun dccReject(id: Int, report: Buffer? = null) = dccAction(id, "reject", report)
+    fun dccCancel(id: Int, report: Buffer? = null) = dccAction(id, "cancel", report)
+    /** Ask a bot for a pack that ended without its file again, at the front of its queue. */
+    fun dccRetry(id: Int, report: Buffer? = null) = dccAction(id, "retry", report)
 
-    private fun dccAction(id: Int, action: String) = io.execute {
+    private fun dccAction(id: Int, action: String, report: Buffer? = null) = io.execute {
         try {
             val req = authed("/api/dcc/$id/$action")
                 .post(ByteArray(0).toRequestBody(null))
                 .build()
             rest.newCall(req).execute().use { res ->
                 if (!res.isSuccessful) {
-                    post { dccError = "DCC $action failed (HTTP ${res.code})" }
+                    val why = runCatching { JSONObject(res.body?.string().orEmpty()).optString("error") }.getOrNull()
+                    val msg = why?.ifEmpty { null } ?: "DCC $action failed (HTTP ${res.code})"
+                    post { dccError = msg; report?.let { localNotice(it, msg) } }
                     return@execute
                 }
                 JSONObject(res.body?.string().orEmpty()).optJSONObject("transfer")?.let {
@@ -3130,21 +3176,6 @@ open class LurkerClient {
         } catch (e: Exception) {
             post { dccError = "DCC $action failed: ${e.message}" }
         }
-    }
-
-    /** Learn this account's DCC grants (newer Lurker), so the chat and send
-     *  actions show only where they'd work. Leaves [dccConfig] null on a server
-     *  without the route — then the old rules apply. */
-    fun refreshDccConfig() = io.execute {
-        // No feature check: the /api/config answer may not have landed yet, and
-        // an older server just answers 404 here.
-        val cfg = runCatching {
-            rest.newCall(authed("/api/dcc/config").build()).execute().use { res ->
-                if (!res.isSuccessful) null
-                else runCatching { DccConfig.parse(JSONObject(res.body?.string().orEmpty())) }.getOrNull()
-            }
-        }.getOrNull()
-        post { dccConfig = cfg }
     }
 
     /** GET /api/dcc/files — the account's kept files. Blocking; io thread. */
@@ -3161,30 +3192,38 @@ open class LurkerClient {
 
     /** A DCC REST call whose JSON answer is handed to [ok]; any refusal lands in
      *  [dccError] with the server's own reason. */
-    private fun dccCall(what: String, req: Request, ok: (JSONObject, Int) -> Unit) = io.execute {
+    private fun dccCall(what: String, req: Request, report: Buffer? = null, ok: (JSONObject, Int) -> Unit) = io.execute {
+        fun fail(msg: String) = post { dccError = msg; report?.let { localNotice(it, msg) } }
         try {
             rest.newCall(req).execute().use { res ->
                 val text = res.body?.string().orEmpty()
                 val body = runCatching { JSONObject(text) }.getOrNull() ?: JSONObject()
                 if (!res.isSuccessful && res.code != 409) {
-                    post { dccError = body.optString("error").ifEmpty { "$what failed (HTTP ${res.code})" } }
+                    fail(body.optString("error").ifEmpty { "$what failed (HTTP ${res.code})" })
                     return@execute
                 }
                 post { ok(body, res.code) }
             }
         } catch (e: Exception) {
-            post { dccError = "$what failed: ${e.message}" }
+            fail("$what failed: ${e.message}")
         }
+    }
+
+    /** A 409's reason, said where the user asked (and on the DCC screen). */
+    private fun dccRefused(b: JSONObject, fallback: String, report: Buffer?) {
+        val msg = b.optString("error").ifEmpty { fallback }
+        dccError = msg
+        report?.let { localNotice(it, msg) }
     }
 
     /** Clear a finished transfer from the list (its kept file stays). One still
      *  holding a partial asks first: [onPartial] fires, and calling again with
      *  [deletePartial] deletes the partial with it. */
-    fun dccClear(id: Int, deletePartial: Boolean = false, onPartial: () -> Unit = {}) =
-        dccCall("Clear", authed("/api/dcc/$id" + if (deletePartial) "?partial=delete" else "").delete().build()) { b, code ->
+    fun dccClear(id: Int, deletePartial: Boolean = false, report: Buffer? = null, onPartial: () -> Unit = {}) =
+        dccCall("Clear", authed("/api/dcc/$id" + if (deletePartial) "?partial=delete" else "").delete().build(), report) { b, code ->
             when {
                 code == 409 && b.optBoolean("partial") -> onPartial()
-                code == 409 -> dccError = b.optString("error").ifEmpty { "Couldn't clear that transfer." }
+                code == 409 -> dccRefused(b, "Couldn't clear that transfer.", report)
                 else -> {
                     transfers.remove(id)
                     b.optJSONArray("ids")?.let { a -> for (i in 0 until a.length()) transfers.remove(a.optInt(i)) }
@@ -3199,10 +3238,13 @@ open class LurkerClient {
         }
 
     /** Delete a finished transfer's file from the server; the row stays. */
-    fun dccDeleteTransferFile(id: Int) =
-        dccCall("Delete", authed("/api/dcc/$id/file").delete().build()) { b, code ->
-            if (code == 409) dccError = b.optString("error").ifEmpty { "Cancel the transfer first." }
-            else b.optJSONObject("transfer")?.let { applyTransfer(it) }
+    fun dccDeleteTransferFile(id: Int, report: Buffer? = null) =
+        dccCall("Delete", authed("/api/dcc/$id/file").delete().build(), report) { b, code ->
+            if (code == 409) dccRefused(b, "Cancel the transfer first.", report)
+            else {
+                b.optJSONObject("transfer")?.let { applyTransfer(it) }
+                report?.let { localNotice(it, "Deleted transfer #$id's file from the server.") }
+            }
         }
 
     /** Delete one of the account's kept files. */
@@ -3212,13 +3254,69 @@ open class LurkerClient {
             else dccFiles.remove(fileId)
         }
 
-    /** Offer one of the account's kept files to [nick] (upstream DCC SEND). */
-    fun dccSendKeptFile(networkId: Int, nick: String, fileId: Int, passive: Boolean = false) {
+    /** Offer one of the account's kept files to [nick] (upstream DCC SEND); [secure]
+     *  offers an SSEND, over TLS (Lurker 2.5). */
+    fun dccSendKeptFile(
+        networkId: Int,
+        nick: String,
+        fileId: Int,
+        passive: Boolean = false,
+        secure: Boolean = false,
+        report: Buffer? = null,
+    ) {
         val body = JSONObject().put("networkId", networkId).put("nick", nick).put("fileId", fileId)
-            .apply { if (passive) put("passive", true) }.toString().toRequestBody(json)
-        dccCall("DCC send", authed("/api/dcc/send").post(body).build()) { b, code ->
-            if (code == 409) dccError = b.optString("error").ifEmpty { "Couldn't send that file." }
+            .apply {
+                if (passive) put("passive", true)
+                if (secure) put("secure", true)
+            }.toString().toRequestBody(json)
+        dccCall("DCC send", authed("/api/dcc/send").post(body).build(), report) { b, code ->
+            if (code == 409) dccRefused(b, "Couldn't send that file.", report)
             else b.optJSONObject("transfer")?.let { dccError = null; applyTransfer(it) }
+        }
+    }
+
+    /** Queue packs from an XDCC bot (Lurker 2.5): it asks for one at a time, every
+     *  bot's queue running at once, on the server — so it carries on while we're away. */
+    fun xdccQueue(networkId: Int, bot: String, packs: List<Int>, report: Buffer? = null) {
+        val body = JSONObject().put("networkId", networkId).put("nick", bot).put("packs", JSONArray(packs))
+            .toString().toRequestBody(json)
+        dccCall("XDCC queue", authed("/api/dcc/xdcc").post(body).build(), report) { b, code ->
+            if (code == 409) {
+                dccRefused(b, "Couldn't queue those packs.", report)
+            } else {
+                val arr = b.optJSONArray("transfers")
+                val queued = ArrayList<Int>()
+                if (arr != null) for (i in 0 until arr.length()) arr.optJSONObject(i)?.let { row ->
+                    applyTransfer(row)
+                    if (!row.isNull("pack")) queued += row.optInt("pack")
+                }
+                dccError = null
+                report?.let {
+                    val skipped = packs.size - queued.size
+                    localNotice(
+                        it,
+                        when {
+                            queued.isEmpty() -> "Already queued for $bot."
+                            skipped > 0 -> "Queued ${DccCommands.describePacks(queued)} from $bot ($skipped already queued)."
+                            else -> "Queued ${DccCommands.describePacks(queued)} from $bot."
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    /** Take packs out of a bot's queue, or (null) the whole queue. One already asked
+     *  for is cancelled, which tells the bot. Needs no grant: stopping never does. */
+    fun xdccRemove(networkId: Int, bot: String, packs: List<Int>?, report: Buffer? = null) {
+        val body = JSONObject().put("networkId", networkId).put("nick", bot)
+            .put("packs", packs?.let { JSONArray(it) } ?: JSONObject.NULL)
+            .toString().toRequestBody(json)
+        dccCall("XDCC remove", authed("/api/dcc/xdcc/remove").post(body).build(), report) { b, _ ->
+            val n = b.optInt("removed", 0)
+            report?.let {
+                localNotice(it, if (n == 0) "Nothing of that was queued for $bot." else "Took $n out of $bot's queue.")
+            }
         }
     }
 
@@ -3353,6 +3451,9 @@ open class LurkerClient {
         filename: String,
         fileBody: okhttp3.RequestBody,
         source: UploadSource? = null,
+        passive: Boolean = false,
+        /** An SSEND, over TLS (Lurker 2.5; the fork's own route has none). */
+        secure: Boolean = false,
     ) = io.execute {
         // Upstream Lurker (after 2.4.3): upload into a dcc-send session, which
         // keeps the file as one of the account's, then offer that file.
@@ -3365,7 +3466,7 @@ open class LurkerClient {
                 val file = uploadViaSession("dcc-send", filename, source).optJSONObject("file")
                     ?.let(DccFile::parse) ?: throw UploadFailed("The server didn't keep the file.")
                 post { dccFiles[file.id] = file }
-                dccSendKeptFile(networkId, nick, file.id)
+                dccSendKeptFile(networkId, nick, file.id, passive = passive, secure = secure)
             } catch (e: Exception) {
                 post { dccError = "DCC send failed: ${e.message}" }
             }
@@ -3410,6 +3511,8 @@ open class LurkerClient {
         passive: Boolean = false,
         reportTo: Buffer? = null,
         focus: Boolean = false,
+        /** An SCHAT, over TLS (Lurker 2.5). A pending offer is taken as it was made. */
+        secure: Boolean = false,
     ) = io.execute {
         val offerKey = "$networkId::${nick.lowercase()}"
         fun fail(msg: String) {
@@ -3418,7 +3521,10 @@ open class LurkerClient {
         try {
             val path = if (open) "/api/dcc/chat" else "/api/dcc/chat/close"
             val body = JSONObject().put("networkId", networkId).put("nick", nick)
-                .apply { if (open && passive) put("passive", true) }
+                .apply {
+                    if (open && passive) put("passive", true)
+                    if (open && secure) put("secure", true)
+                }
                 .toString().toRequestBody(json)
             rest.newCall(authed(path).post(body).build()).execute().use { res ->
                 if (!res.isSuccessful) {
@@ -3446,6 +3552,12 @@ open class LurkerClient {
         return "$networkId::${buffer.peer.lowercase()}" in dccChatsLive
     }
 
+    /** True when [buffer]'s DCC chat runs (or last ran) over TLS. */
+    fun isDccChatSecure(buffer: Buffer): Boolean {
+        val networkId = buffer.networkId ?: return false
+        return "$networkId::${buffer.peer.lowercase()}" in dccSecureChats
+    }
+
     /** The pending inbound offer from [buffer]'s peer, if any. */
     fun dccOfferFor(buffer: Buffer): DccChatOffer? {
         val networkId = buffer.networkId ?: return null
@@ -3458,7 +3570,8 @@ open class LurkerClient {
         val key = "$networkId::${from.lowercase()}"
         when (frame.optString("type")) {
             "dcc-chat-offer" -> {
-                dccChatOffers[key] = DccChatOffer(networkId, from, frame.optBoolean("passive", false))
+                val secure = frame.optBoolean("secure", false)
+                dccChatOffers[key] = DccChatOffer(networkId, from, frame.optBoolean("passive", false), secure)
                 // A peer is waiting on an answer — worth a notification when we're
                 // not on screen. Routed to the server buffer, where the server also
                 // prints the offer.
@@ -3467,14 +3580,18 @@ open class LurkerClient {
                     notificationSink?.invoke(
                         NotifiableEvent(
                             networkId, server?.target ?: ":server:$networkId", from,
-                            "wants to start a DCC chat", isDm = true,
+                            if (secure) "wants to start a secure DCC chat" else "wants to start a DCC chat", isDm = true,
                         ),
                     )
                 }
             }
             "dcc-chat-offer-closed" -> dccChatOffers.remove(key)
-            "dcc-chat-state" ->
-                if (frame.optBoolean("live", false)) dccChatsLive.add(key) else dccChatsLive.remove(key)
+            "dcc-chat-state" -> {
+                val live = frame.optBoolean("live", false)
+                if (live) dccChatsLive.add(key) else dccChatsLive.remove(key)
+                // An end keeps its `secure`, so a re-offer is the same kind.
+                if (frame.optBoolean("secure", false)) dccSecureChats.add(key) else if (live) dccSecureChats.remove(key)
+            }
         }
     }
 
@@ -4055,10 +4172,14 @@ open class LurkerClient {
         )
     }
 
-    private fun applyTransfer(o: JSONObject) {
+    private fun applyTransfer(o: JSONObject, live: Boolean = false) {
         val id = o.optInt("id", -1)
         if (id < 0) return
-        transfers[id] = DccTransfer(
+        // 0/1 from the database, true/false from an older row shape.
+        fun flag(k: String) = o.optInt(k, 0) == 1 || o.optBoolean(k, false)
+        fun intOrNull(k: String) = if (o.isNull(k)) null else o.optInt(k, -1).takeIf { it >= 0 }
+        val known = transfers[id]
+        val t = DccTransfer(
             id = id,
             peerNick = o.optString("peer_nick", "?"),
             filename = o.optString("filename", "file"),
@@ -4070,7 +4191,48 @@ open class LurkerClient {
             hasFile = !o.isNull("destination_path") && o.optString("destination_path").isNotEmpty() &&
                 (o.isNull("file_deleted_at") || o.optString("file_deleted_at").isEmpty()),
             fileId = if (o.isNull("file_id")) null else o.optInt("file_id", -1).takeIf { it > 0 },
+            networkId = intOrNull("network_id")?.takeIf { it > 0 },
+            passive = flag("passive"),
+            secure = flag("secure"),
+            crcStatus = if (o.isNull("crc_status")) null else o.optString("crc_status").ifEmpty { null },
+            pack = intOrNull("pack"),
+            queueSeq = intOrNull("queue_seq"),
+            attempt = o.optInt("attempt", 1),
+            botAcked = !o.isNull("bot_acked_at") && o.optString("bot_acked_at").isNotEmpty(),
         )
+        transfers[id] = t
+        trackRate(t)
+        // Someone offered a file while we're not on screen: worth a nudge, as a
+        // chat offer is. Only for a fresh live offer (not a list reload).
+        if (live && known == null && t.isPending && !t.isSend && !appForeground) {
+            notificationSink?.invoke(
+                NotifiableEvent(
+                    t.networkId, t.peerNick, t.peerNick,
+                    "offers you a file: ${t.filename}" + (if (t.secure) " (secure)" else ""), isDm = true,
+                ),
+            )
+        }
+    }
+
+    /** Smoothed bytes a second while [t] moves; gone once it stops. */
+    private fun trackRate(t: DccTransfer) {
+        if (t.state != "receiving" && t.state != "sending") {
+            rateSamples.remove(t.id)
+            transferRates.remove(t.id)
+            return
+        }
+        val now = System.nanoTime() / 1_000_000
+        val prev = rateSamples[t.id]
+        if (prev == null || t.received < prev.first) {
+            rateSamples[t.id] = t.received to now
+            return
+        }
+        val dt = now - prev.second
+        if (dt < 1_000) return
+        val inst = (t.received - prev.first) * 1_000 / dt
+        val old = transferRates[t.id]
+        transferRates[t.id] = if (old == null) inst else (old * 6 + inst * 4) / 10
+        rateSamples[t.id] = t.received to now
     }
 
     // ---- Settings ---------------------------------------------------------

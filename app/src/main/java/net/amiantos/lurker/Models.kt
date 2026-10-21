@@ -104,7 +104,13 @@ data class Buffer(
 
 /** A peer's inbound DCC CHAT offer awaiting our answer. Nothing is dialled until
  *  it's accepted; the server expires it after ten minutes. */
-data class DccChatOffer(val networkId: Int, val nick: String, val passive: Boolean) {
+data class DccChatOffer(
+    val networkId: Int,
+    val nick: String,
+    val passive: Boolean,
+    /** An SCHAT (KVIrc): the chat runs over TLS once accepted (Lurker 2.5+). */
+    val secure: Boolean = false,
+) {
     val key: String get() = "$networkId::${nick.lowercase()}"
 }
 
@@ -265,6 +271,8 @@ data class DccFile(
     val createdAt: String?,
     val peerNick: String?,
     val networkId: Int?,
+    /** ok / mismatch against the CRC32 in its name, absent, unverified; null for an upload. */
+    val crcStatus: String? = null,
 ) {
     companion object {
         fun parse(o: org.json.JSONObject): DccFile? {
@@ -278,6 +286,7 @@ data class DccFile(
                 createdAt = o.optString("created_at").ifEmpty { null },
                 peerNick = if (o.isNull("peer_nick")) null else o.optString("peer_nick").ifEmpty { null },
                 networkId = if (o.isNull("network_id")) null else o.optInt("network_id"),
+                crcStatus = if (o.isNull("crc_status")) null else o.optString("crc_status").ifEmpty { null },
             )
         }
     }
@@ -313,10 +322,32 @@ data class DccTransfer(
     val hasFile: Boolean = false,
     /** The kept DCC file a completed receive produced, or the one a send sends. */
     val fileId: Int? = null,
+    /** Null once its network was deleted (the row and its file stay). */
+    val networkId: Int? = null,
+    /** The peer listens and the server dials (a firewalled sender's offer). */
+    val passive: Boolean = false,
+    /** Over TLS — KVIrc's SSEND (Lurker 2.5+). Encryption, not identity. */
+    val secure: Boolean = false,
+    /** How a received file checked out: ok / mismatch / absent / unverified. */
+    val crcStatus: String? = null,
+    /** The XDCC pack number, on a row a bot's queue owns (Lurker 2.5+). */
+    val pack: Int? = null,
+    /** Its place in that bot's queue: the lowest queued one goes next. */
+    val queueSeq: Int? = null,
+    /** 2 on the queue's one automatic retry of a pack that failed. */
+    val attempt: Int = 1,
+    /** The bot answered the request (put us in its own queue, say). */
+    val botAcked: Boolean = false,
 ) {
     /** Done one way or another — something the list can be cleared of. */
     val isFinished: Boolean get() = isTerminal
     val isCompleted: Boolean get() = state == "completed"
+    /** A pack waiting its turn in a bot's queue, or asked for and not offered yet. */
+    val isQueuedPack: Boolean get() = pack != null && (state == "queued" || state == "requested")
+    /** A pack that ended without its file can be asked for again (front of the queue). */
+    val canRetry: Boolean get() = pack != null && !isSend && (state == "failed" || state == "stalled")
+    /** A receive that ended with part of a file on the server, still taking space. */
+    val hasPartial: Boolean get() = !isSend && isFinished && !isCompleted && hasFile && received > 0
 
     val progress: Float
         get() = if (total > 0) (received.toFloat() / total).coerceIn(0f, 1f) else 0f
@@ -324,7 +355,7 @@ data class DccTransfer(
     val isSend: Boolean get() = direction == "send"
     val isActive: Boolean
         get() = state in setOf(
-            "connecting", "receiving", "stalled", "verifying", "requested",
+            "connecting", "receiving", "stalled", "verifying", "requested", "queued",
             "offering", "offered", "sending", // outgoing-send states (fork, upstream)
         )
     val isTerminal: Boolean

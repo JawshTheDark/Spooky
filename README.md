@@ -60,7 +60,8 @@ Pick the mode on first launch; it can be switched later from Settings.
   ban, notes…). Long-press any message to whois its sender; tap a `#channel` in any message to be
   offered the join.
 - **Composer.** Formatting toolbar + colour picker, tab-completion for nicks and commands, typing
-  indicators, swipe-to-reply, and image/file uploads (plus Android share-sheet targets). Oversized
+  indicators, swipe-to-reply, Quote (`> <nick> text` above your answer, and `> ` lines drawn as
+  quotes), and image/file uploads (plus Android share-sheet targets). Oversized
   files are refused up front against the ceiling the server advertises, rather than after the upload;
   on a server with upload sessions, big files go up in resumable chunks.
 - **Nothing sent is lost.** A message that can't go out — offline, mid-reconnect, rejected, or
@@ -73,9 +74,11 @@ Pick the mode on first launch; it can be switched later from Settings.
 - **Search & contacts.** Server-side message search, highlights, and bookmarks. Friends carry
   multiple per-network identities and show presence on each — green online, yellow away, red
   offline, grey unknown.
-- **DCC.** Receive **and** send file transfers, plus DCC chat, with live progress. On a newer Lurker
-  it follows the account's per-feature grants, and kept files can be saved to the phone, sent on, or
-  deleted.
+- **DCC.** Receive **and** send file transfers, plus DCC chat, with live progress, speed and time
+  left. On Lurker 2.5 it follows the account's per-feature grants; kept files can be saved to the
+  phone, sent on, or deleted, and show their checksum result; XDCC packs queue per bot on the server
+  (`/xdcc add|queue|rmp|rmbot`); and Secure DCC (KVIrc's SCHAT/SSEND) runs chats and sends over TLS.
+  Offers pop up with Accept / Decline / Later. The full `/dcc` command set works from the composer.
 - **Settings.** A registry-driven editor over the server's settings surface — every advertised
   setting is editable by type — alongside device-local app preferences. Includes an in-app
   diagnostics log (connection + error history) to paste into a bug report.

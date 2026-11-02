@@ -69,6 +69,7 @@ object Completion {
         "topic", "kick", "invite", "mode", "op", "deop", "voice", "devoice",
         "halfop", "dehalfop", "ban", "unban", "whois", "whowas", "raw", "quote",
         "ns", "cs", "ms", "away", "back", "ctcp", "ping", "slap", "quit", "cycle", "dcc",
-        "hop", "e2e", "list", "channels", "help",
+        "hop", "e2e", "list", "channels", "help", "xdcc", "relay", "accept", "metadata",
+        "avatar", "displayname",
     )
 }

@@ -55,13 +55,23 @@ Pick the mode on first launch; it can be switched later from Settings.
   top so a new DM can't hide down the list. Secure (E2E) buffers show a lock.
 - **Mentions.** Highlighted messages get a gold bubble (colour configurable), and tapping a
   notification opens the channel and jumps to the exact message. Notifications are actionable —
-  reply, mark read, or mute — including from a paired Wear OS watch.
+  reply, mark read, or mute — including from a paired Wear OS watch. Each channel or DM sits on
+  the web's ladder — All messages, Highlights only, Nothing, or Muted (which counts highlights
+  only). Caller ID (`+g`) offers to accept someone it turned away (`/accept`).
 - **Members.** Full member list with op/voice prefixes and per-nick actions (query, whois, op, kick,
   ban, notes…). Long-press any message to whois its sender; tap a `#channel` in any message to be
-  offered the join.
+  offered the join. IRCv3 display names show in place of nicks, and a member's profile shows their
+  avatar, pronouns, status and homepage (`/displayname`, `/avatar`, `/metadata` set your own).
+- **Relay bots.** Mark a bridge bot (Discord, Matrix, another network) and its `[source] <nick> text`
+  lines read as the person who wrote them, source beside their name — bridges of bridges included.
+  Custom formats and a line tester live in **Relay bots** (the ⋯ menu); `/relay` works too. On
+  Lurker the marks are server-held, so they match the web client; in direct mode they stay on the phone.
+- **Reply threads.** With Lurker's *Reply threads* setting on, a channel's replies move into
+  threads: a `╰─ 3 replies` chip opens the thread with its own composer, and the title menu lists a
+  channel's threads.
 - **Composer.** Formatting toolbar + colour picker, tab-completion for nicks and commands, typing
   indicators, swipe-to-reply, Quote (`> <nick> text` above your answer, and `> ` lines drawn as
-  quotes), and image/file uploads (plus Android share-sheet targets). Oversized
+  quotes) and Copy quote, and image/file uploads (plus Android share-sheet targets). Oversized
   files are refused up front against the ceiling the server advertises, rather than after the upload;
   on a server with upload sessions, big files go up in resumable chunks.
 - **Nothing sent is lost.** A message that can't go out — offline, mid-reconnect, rejected, or

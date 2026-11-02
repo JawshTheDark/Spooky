@@ -44,6 +44,12 @@ sealed interface ParsedInput {
     data class Dcc(val cmd: DccCommand) : ParsedInput
     /** A `/xdcc` line: the server-side XDCC queue (Lurker 2.5). */
     data class Xdcc(val cmd: XdccCommand) : ParsedInput
+    /** A `/relay` line: list, mark or unmark relay/bridge bots on this network. */
+    data class Relay(val cmd: RelayCommand) : ParsedInput
+    /** `/metadata`, `/avatar`, `/displayname` (Lurker 2.6): a raw METADATA [line].
+     *  [write] = it changes your own record, which needs a connected network that
+     *  keeps metadata (the server saves the row itself once it's accepted). */
+    data class Metadata(val line: String, val write: Boolean) : ParsedInput
 }
 
 object Commands {
@@ -246,6 +252,31 @@ object Commands {
                 else -> ParsedInput.Xdcc(c)
             }
 
+            // Relay/bridge bots (Lurker #277). The pattern is the raw rest of the
+            // line, spaces and all.
+            "relay" -> when (val c = net.amiantos.lurker.Relay.parseCommand(rest)) {
+                is RelayCommand.Error -> err("/relay: ${c.message}")
+                else -> ParsedInput.Relay(c)
+            }
+
+            // Caller ID (+g): let these nicks' messages through. `/accept a b -c`
+            // → ACCEPT a,b,-c; bare `/accept` lists who's accepted (ACCEPT *).
+            "accept" -> raw("ACCEPT " + rest.split(Regex("[\\s,]+")).filter { it.isNotEmpty() }.joinToString(",").ifEmpty { "*" })
+
+            // IRCv3 metadata: your display name, avatar and the rest (Lurker 2.6).
+            "metadata" -> metadataCommand(rest)
+            "avatar" -> when {
+                rest.isEmpty() -> err("usage: /avatar <https://…/image.png> · /avatar off")
+                rest.equals("off", true) -> metadataSet("avatar", null)
+                !Regex("^https?://\\S+$", RegexOption.IGNORE_CASE).matches(rest) -> err("/avatar: the avatar must be an http(s) URL")
+                else -> metadataSet("avatar", rest)
+            }
+            "displayname" -> when {
+                rest.isEmpty() -> err("usage: /displayname <name> · /displayname off")
+                rest.equals("off", true) -> metadataSet("display-name", null)
+                else -> metadataSet("display-name", rest)
+            }
+
             "slap" -> if (rest.isEmpty()) err("Usage: /slap <nick>")
                 else ParsedInput.Ops(listOf(WireOp("action", text = SLAP.format(rest))))
 
@@ -268,6 +299,40 @@ object Commands {
             "e2e" -> ParsedInput.Ops(listOf(WireOp("e2e", target = currentTarget, line = rest)))
 
             else -> err("Unknown command: /$verb  (try /help, or /raw to send it literally)")
+        }
+    }
+
+    private val METADATA_KEY = Regex("^[a-z0-9_./-]+$")
+
+    private fun metadataSet(key: String, value: String?): ParsedInput {
+        if (!METADATA_KEY.matches(key)) {
+            return ParsedInput.Local("invalid metadata key: $key (a-z, 0-9, _ . / -)", isError = true)
+        }
+        val clean = value?.replace(Regex("[\\r\\n\\u0000]"), "")?.trim().orEmpty()
+        return ParsedInput.Metadata(if (clean.isEmpty()) "METADATA * SET $key" else "METADATA * SET $key :$clean", write = true)
+    }
+
+    /** `/metadata set|del|list|clear …`, as the web reads it. */
+    private fun metadataCommand(argLine: String): ParsedInput {
+        val trimmed = argLine.trim()
+        val space = trimmed.indexOfFirst { it.isWhitespace() }
+        val sub = (if (space < 0) trimmed else trimmed.substring(0, space)).lowercase()
+        val rest = if (space < 0) "" else trimmed.substring(space + 1).trim()
+        return when (sub) {
+            "set" -> {
+                val at = rest.indexOfFirst { it.isWhitespace() }
+                if (rest.isEmpty() || at < 0) ParsedInput.Local("usage: /metadata set <key> <value>", isError = true)
+                else metadataSet(rest.substring(0, at).lowercase(), rest.substring(at + 1))
+            }
+            "del", "unset", "delete" ->
+                if (rest.isEmpty() || rest.any { it.isWhitespace() }) ParsedInput.Local("usage: /metadata del <key>", isError = true)
+                else metadataSet(rest.lowercase(), null)
+            "list" -> ParsedInput.Metadata("METADATA ${rest.split(Regex("\\s+"))[0].ifEmpty { "*" }} LIST", write = false)
+            "clear" -> ParsedInput.Metadata("METADATA * CLEAR", write = true)
+            else -> ParsedInput.Local(
+                "usage: /metadata set <key> <value> · /metadata del <key> · /metadata list [nick|#chan] · /metadata clear",
+                isError = true,
+            )
         }
     }
 
@@ -315,6 +380,8 @@ object Commands {
         appendLine("/dcc [list], /dcc files, /dcc accept|reject|cancel|download|delete|retry <id>, /dcc clear [<id>]")
         appendLine("/dcc send [-passive] [-secure] <nick> [<file>], /dcc chat [-passive] [-secure] <nick>, /dcc close chat <nick>")
         appendLine("/xdcc add|addl|addm <bot> <packs>, /xdcc queue [<bot>], /xdcc rmp|rmpl|rmpm <bot> <packs>, /xdcc rmbot <bot>")
+        appendLine("/relay [list], /relay add <nick> [pattern], /relay remove <nick> — e.g. /relay add bridge <{nick}> {message}")
+        appendLine("/accept [nick…] (caller ID), /displayname <name>|off, /avatar <url>|off, /metadata set|del|list|clear")
         append("Prefix a literal slash with // to send it as a message.")
     }
 }

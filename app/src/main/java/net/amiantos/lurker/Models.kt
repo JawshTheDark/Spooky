@@ -3,6 +3,14 @@
 
 package net.amiantos.lurker
 
+/**
+ * A string field, or null when it's missing, empty or JSON `null`. Android's
+ * `optString` turns a JSON null into the four letters "null", which is how a
+ * channel with no topic showed "null" and a transfer row a red "null" error.
+ */
+internal fun org.json.JSONObject.str(key: String): String? =
+    if (isNull(key)) null else optString(key).ifEmpty { null }
+
 /** A configured IRC network as the server describes it. */
 data class Network(
     val id: Int,
@@ -144,12 +152,54 @@ data class Msg(
      *  as one. Read from the server's stamp, not [ReplyRef.parent]: the parent can
      *  be gone while the stamp is what the server's counts use. */
     val replyToSelf: Boolean = false,
+    /** Display-only: set on a copy re-attributed to the speaker inside a marked
+     *  relay bot's envelope ([nick]/[text] are theirs); this is the bot's nick. */
+    val relayBot: String? = null,
+    /** The envelope's `[source]` tag (e.g. "Discord"), when it had one. */
+    val relaySource: String? = null,
+    /** Display-only: the sender's IRCv3 display name to show in place of [nick]
+     *  (Lurker 2.6); [nick] stays what every action and colour keys on. */
+    val displayName: String? = null,
+    /** This line starts a reply thread (Lurker 2.6): how many replies, at any depth. */
+    val threadReplies: Int = 0,
+    /** When the newest of them came. */
+    val threadLastTime: String? = null,
 )
 
 /** The line an IRCv3 reply answers. [parent] is null when the server no longer
  *  holds it (retention, before your history, an ignored author): show the reply
  *  without its context. */
-data class ReplyRef(val msgid: String, val parent: ReplyParent?)
+data class ReplyRef(
+    val msgid: String,
+    val parent: ReplyParent?,
+    /** The msgid of the line at the top of this reply's thread (Lurker 2.6); null
+     *  on rows stored before roots were tracked. */
+    val root: String? = null,
+)
+
+/** A reply thread the user follows (posted in, was highlighted in, or started). */
+data class FollowedThread(
+    val networkId: Int,
+    val target: String,
+    val bufferId: Int,
+    val rootMsgid: String,
+    val unread: Int,
+    val highlighted: Boolean,
+)
+
+/** One of a buffer's threads, as the `threads` list gives it. */
+data class ThreadSummary(val rootMsgid: String, val root: ReplyParent?, val replies: Int, val lastReplyTime: String?)
+
+/** The thread open in the thread sheet. [loading] until the server's `thread` lands. */
+data class ThreadView(
+    val bufferKey: String,
+    val rootMsgid: String,
+    val token: Int,
+    val root: Msg?,
+    val replies: List<Msg>,
+    val truncated: Boolean = false,
+    val loading: Boolean = false,
+)
 
 /** An answered line as the server quotes it: [text] is clipped to 300 characters
  *  with formatting codes intact, [id] is the jump target. */
@@ -283,10 +333,10 @@ data class DccFile(
                 name = o.optString("name", "file"),
                 size = o.optLong("size", 0),
                 origin = o.optString("origin", "received"),
-                createdAt = o.optString("created_at").ifEmpty { null },
-                peerNick = if (o.isNull("peer_nick")) null else o.optString("peer_nick").ifEmpty { null },
+                createdAt = o.str("created_at"),
+                peerNick = if (o.isNull("peer_nick")) null else o.str("peer_nick"),
                 networkId = if (o.isNull("network_id")) null else o.optInt("network_id"),
-                crcStatus = if (o.isNull("crc_status")) null else o.optString("crc_status").ifEmpty { null },
+                crcStatus = if (o.isNull("crc_status")) null else o.str("crc_status"),
             )
         }
     }
@@ -509,6 +559,19 @@ data class NetworkConfig(
     val blocked: Boolean,
     /** Direct-mode endpoint kind ("direct" | "soju" | "znc"); ignored in Lurker mode. */
     val type: String = "direct",
+    /** Pace outbound lines against the server's flood clock (Lurker 2.6, #1193).
+     *  Off only for a network that exempts you, or a bouncer that paces itself. */
+    val floodProtection: Boolean = true,
+)
+
+/** A network the add form offers in one tap (a few of the web picker's, Lurker.Chat first). */
+data class NetworkPreset(val name: String, val host: String, val port: Int = 6697, val tls: Boolean = true, val channel: String? = null)
+
+val NETWORK_PRESETS = listOf(
+    NetworkPreset("Lurker.Chat", "irc.lurker.chat", channel = "#lobby"),
+    NetworkPreset("Libera.Chat", "irc.libera.chat", channel = "#libera"),
+    NetworkPreset("OFTC", "irc.oftc.net", channel = "#oftc"),
+    NetworkPreset("hackint", "irc.hackint.org", channel = "#hackint"),
 )
 
 /**
@@ -538,3 +601,42 @@ data class SettingOption(
      */
     val requiresFeature: String? = null,
 )
+
+/**
+ * A nick's (or channel's) IRCv3 metadata as Lurker relays it (2.6, #607). Every
+ * field is optional; [avatarUrl] is server-minted (the avatar route or a CDN,
+ * never the URL the user set) and null when the server can't serve one.
+ */
+data class UserMeta(
+    val displayName: String? = null,
+    val avatarUrl: String? = null,
+    val pronouns: String? = null,
+    val homepage: String? = null,
+    val status: String? = null,
+) {
+    /** The display name worth showing instead of the nick: one that isn't
+     *  empty once its formatting is gone. */
+    val shownName: String? get() = displayName?.let { Mirc.strip(it).trim() }?.takeIf { it.isNotEmpty() }
+
+    companion object {
+        /** Null when there's nothing in it. */
+        fun parse(o: org.json.JSONObject?): UserMeta? {
+            if (o == null) return null
+            fun s(k: String) = if (o.isNull(k)) null else o.optString(k).takeIf { it.isNotEmpty() }
+            val m = UserMeta(s("displayName"), s("avatarUrl"), s("pronouns"), s("homepage"), s("status"))
+            return m.takeIf { it != UserMeta() }
+        }
+    }
+}
+
+/** What a network lets you keep in your own metadata (draft/metadata-2 limits). */
+data class MetadataLimits(val maxKeys: Int, val maxValueBytes: Int, val beforeConnect: Boolean) {
+    companion object {
+        fun parse(o: org.json.JSONObject?): MetadataLimits? = o?.let {
+            MetadataLimits(it.optInt("maxKeys", -1), it.optInt("maxValueBytes", -1), it.optBoolean("beforeConnect", false))
+        }
+    }
+}
+
+/** Someone our caller ID (+g) turned away: accepting lets their next message in. */
+data class CallerIdBlock(val networkId: Int, val nick: String, val at: Long = System.currentTimeMillis())

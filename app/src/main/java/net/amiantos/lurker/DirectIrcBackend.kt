@@ -57,6 +57,8 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
         ignores.clear()
         ignores.addAll(store.loadIgnores())
         nextIgnoreId.set((ignores.maxOfOrNull { it.id } ?: 0L) + 1L)
+        relayBots.clear()
+        store.loadRelayBots().forEach { relayBots["${it.networkId}::${it.nick.lowercase()}"] = it }
         // Restore persisted message tails so buffers + history survive a restart
         // (direct networks have no server-side backlog; a bouncer re-sends its own).
         store.loadMessages().forEach { pb ->
@@ -88,6 +90,19 @@ class DirectIrcBackend(appContext: Context) : LurkerClient() {
     override fun removeIgnore(networkId: Int?, id: Long) {
         ignores.removeAll { it.id == id }
         store.saveIgnores(ignores.toList())
+    }
+
+    // Relay-bot marks: on the server in Lurker mode, local + persisted here.
+    override fun setRelayBot(networkId: Int, nick: String, marked: Boolean, pattern: String) {
+        val n = nick.trim()
+        if (n.isEmpty()) return
+        val key = "$networkId::${n.lowercase()}"
+        if (marked) {
+            relayBots[key] = RelayBot(networkId, relayBots[key]?.nick ?: n, pattern.take(Relay.MAX_PATTERN))
+        } else {
+            relayBots.remove(key)
+        }
+        store.saveRelayBots(relayBots.values.toList())
     }
 
     private fun refreshConfigs() = post {

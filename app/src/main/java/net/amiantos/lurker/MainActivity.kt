@@ -263,6 +263,7 @@ internal sealed interface Screen {
     data object Search : Screen
     data object Friends : Screen
     data object Ignores : Screen
+    data object RelayBots : Screen
     data object Multichan : Screen
     data class ChannelList(val query: String? = null) : Screen
     data class NetworkEdit(val config: NetworkConfig?) : Screen
@@ -286,6 +287,7 @@ internal fun encodeScreen(s: Screen): String = when (s) {
     Screen.Search -> "search"
     Screen.Friends -> "friends"
     Screen.Ignores -> "ignores"
+    Screen.RelayBots -> "relaybots"
     Screen.Multichan -> "multichan"
     is Screen.Chat -> listOf(
         "chat",
@@ -319,6 +321,7 @@ internal fun decodeScreen(raw: String): Screen {
         "search" -> Screen.Search
         "friends" -> Screen.Friends
         "ignores" -> Screen.Ignores
+        "relaybots" -> Screen.RelayBots
         "multichan" -> Screen.Multichan
         else -> Screen.Buffers
     }
@@ -434,6 +437,17 @@ class MainActivity : FragmentActivity() {
                 // One pump for the whole app: pacing is a global property, so a
                 // per-row pump would be twenty pumps racing the same rate limit.
                 ServerPreviewPump(client)
+                // A DCC failure from anywhere but the DCC screen (a banner's Accept, a
+                // send started from a chat) said nothing — it only showed there.
+                val dccToastCtx = LocalContext.current
+                LaunchedEffect(client.dccError) {
+                    val err = client.dccError
+                    // Not the list's own load failing on a reconnect: that's background
+                    // noise, and the DCC screen shows it when opened.
+                    if (err != null && screen != Screen.Dcc && !err.startsWith("Failed to load")) {
+                        android.widget.Toast.makeText(dccToastCtx, err, android.widget.Toast.LENGTH_LONG).show()
+                    }
+                }
                 // Re-focus a chat we RESTORED (rotation or a process-death relaunch).
                 // Guarded on the client's current focus: rotation keeps it already
                 // set, and re-running setActive would re-anchor the "New messages"
@@ -561,6 +575,7 @@ class MainActivity : FragmentActivity() {
                             onSearch = { screen = Screen.Search },
                             onFriends = { screen = Screen.Friends },
                             onIgnores = { screen = Screen.Ignores },
+                            onRelayBots = { screen = Screen.RelayBots },
                             onBrowse = { screen = Screen.ChannelList() },
                             onOpenMultichan = { screen = Screen.Multichan },
                             onSignOut = { LurkerConnectionService.stop(this@MainActivity); client.signOut() },
@@ -583,7 +598,8 @@ class MainActivity : FragmentActivity() {
                             // Two-pane hides the rail (so its overflow actions are
                             // stubbed), but the chat's top-bar gear still needs Settings.
                             onSettings = { client.loadSettings(); screen = Screen.Settings },
-                            onDcc = {}, onNetworks = {},
+                            onDcc = { client.loadDcc(); screen = Screen.Dcc },
+                            onNetworks = {},
                             onSearch = {}, onFriends = {}, onIgnores = {}, onBrowse = {}, onSignOut = {},
                             showList = false,
                             showRoster = true,
@@ -611,6 +627,7 @@ class MainActivity : FragmentActivity() {
                         onSearch = { go(Screen.Search) },
                         onFriends = { go(Screen.Friends) },
                         onIgnores = { go(Screen.Ignores) },
+                        onRelayBots = { go(Screen.RelayBots) },
                         onBrowse = { go(Screen.ChannelList()) },
                         onOpenMultichan = { go(Screen.Multichan) },
                         onSignOut = { LurkerConnectionService.stop(this@MainActivity); client.signOut() },
@@ -668,6 +685,7 @@ class MainActivity : FragmentActivity() {
                         onBack = { back() },
                     )
                     Screen.Ignores -> IgnoresScreen(client) { back() }
+                    Screen.RelayBots -> RelayBotsScreen(client) { back() }
                     Screen.Multichan -> MultichanScreen(
                         client = client,
                         onBack = { back() },
@@ -920,6 +938,7 @@ private fun TabletHome(
     onSearch: () -> Unit,
     onFriends: () -> Unit,
     onIgnores: () -> Unit,
+    onRelayBots: () -> Unit = {},
     onBrowse: () -> Unit,
     onOpenMultichan: () -> Unit = {},
     onSignOut: () -> Unit,
@@ -946,6 +965,7 @@ private fun TabletHome(
                     onSearch = onSearch,
                     onFriends = onFriends,
                     onIgnores = onIgnores,
+                    onRelayBots = onRelayBots,
                     onBrowse = onBrowse,
                     onOpenMultichan = onOpenMultichan,
                     onSignOut = onSignOut,
@@ -1228,12 +1248,16 @@ private fun ChannelControlPanel(
 
                 HorizontalDivider(color = GlassBorder)
 
-                // Notifications.
-                PanelToggleRow("Notify on every message", client.isNotifyAlways(buffer)) {
-                    client.setNotifyAlways(buffer, it)
-                }
-                PanelToggleRow("Mute notifications", client.isNotifyMuted(buffer)) {
-                    client.setNotifyMuted(buffer, it)
+                // Notifications: the web's ladder (Lurker 2.6). Muted also stops the
+                // unread count, leaving only real highlights.
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("NOTIFICATIONS", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                    val level = client.notifyLevel(buffer)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        notifyRungs(buffer.isChannel, muteable = client.serverFeatures).forEach { (key, label) ->
+                            ModeChip(label, level == key) { client.setNotifyLevel(buffer, key) }
+                        }
+                    }
                 }
                 // Per-channel compact layout (overrides the global default).
                 val panelCtx = LocalContext.current
@@ -1316,6 +1340,16 @@ private fun PanelToggleRow(label: String, checked: Boolean, onChange: (Boolean) 
             )
         }
     }
+}
+
+/** The notification ladder's rungs, as the web labels them: a channel's default
+ *  is Highlights only, a DM's All messages (it has no highlights rung). Muted
+ *  needs a Lurker server — it's the server that stops counting. */
+private fun notifyRungs(isChannel: Boolean, muteable: Boolean): List<Pair<String, String>> = buildList {
+    add("all" to "All messages")
+    if (isChannel) add("highlights" to "Highlights only")
+    add("nothing" to "Nothing")
+    if (muteable) add("muted" to "Muted")
 }
 
 /** A small tappable action pill used in the channel control panel. */
@@ -1566,6 +1600,7 @@ private fun BufferListScreen(
     onBrowse: () -> Unit,
     onOpenMultichan: () -> Unit,
     onSignOut: () -> Unit,
+    onRelayBots: () -> Unit = {},
 ) {
     var menuOpen by remember { mutableStateOf(false) }
 
@@ -1642,6 +1677,8 @@ private fun BufferListScreen(
                             DropdownMenuItem(text = { Text("Friends") }, onClick = { menuOpen = false; onFriends() })
                         }
                         DropdownMenuItem(text = { Text("Ignore list") }, onClick = { menuOpen = false; onIgnores() })
+                        // Bridge bots whose lines read as the person inside.
+                        DropdownMenuItem(text = { Text("Relay bots") }, onClick = { menuOpen = false; onRelayBots() })
                         DropdownMenuItem(text = { Text("Networks") }, onClick = { menuOpen = false; onNetworks() })
                         DropdownMenuItem(text = { Text("Settings") }, onClick = { menuOpen = false; onSettings() })
                         if (client.serverFeatures) {
@@ -1700,6 +1737,9 @@ private fun BufferListBody(
             ) {
                 item { DccBanner(client, current = null, onOpenDcc = onOpenDcc) }
             }
+            if (client.accountPaused || client.callerIdBlocked.isNotEmpty()) {
+                item { AccountBanners(client, current = null) }
+            }
             // The Multi-channel firehose: a single pinned entry above every network
             // that merges the timelines of all toggled channels. Shown only once at
             // least one channel opts in (from its control panel).
@@ -1735,14 +1775,42 @@ private fun BufferListBody(
             }
             items(rows.size) { index ->
                 val section = rows[index]
-                Text(
-                    section.network,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = TextSecondary,
-                    modifier = Modifier.fillMaxWidth().padding(28.dp, 18.dp, 16.dp, 6.dp),
-                )
-                Surface(
+                val netId = section.networkId
+                if (netId != null) {
+                    // A network's header carries its connection state, as on the web.
+                    val net = client.networks[netId]
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(28.dp, 18.dp, 16.dp, 6.dp),
+                    ) {
+                        Text(
+                            section.network,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = TextSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (net != null) {
+                            Spacer(Modifier.width(7.dp))
+                            Box(Modifier.size(7.dp).background(if (net.connected) OnlineGreen else AlertRed, CircleShape))
+                            if (!net.connected) {
+                                Spacer(Modifier.width(6.dp))
+                                Text("disconnected", fontSize = 12.sp, color = TextSecondary)
+                            }
+                        }
+                    }
+                } else {
+                    Text(
+                        section.network,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = TextSecondary,
+                        modifier = Modifier.fillMaxWidth().padding(28.dp, 18.dp, 16.dp, 6.dp),
+                    )
+                }
+                if (section.buffers.isNotEmpty()) Surface(
                     color = SurfaceDark,
                     shape = RoundedCornerShape(12.dp),
                     border = BorderStroke(0.5.dp, GlassBorder),
@@ -1755,7 +1823,7 @@ private fun BufferListBody(
                             // span networks), and are NOT closeable/pinnable here (a
                             // friend buffer is unclosable — closing would just collapse
                             // it back to this same row).
-                            val isFriendRow = section.network == "Friends"
+                            val isFriendRow = netId == null && section.network == "Friends"
                             // Cache the E2E history scan (up to 150 msgs) per row, so a
                             // buffer-list recompose (unread/pin/presence ticks) doesn't
                             // re-scan every buffer's history every frame. Recomputes only
@@ -1769,14 +1837,20 @@ private fun BufferListBody(
                             }
                             BufferRow(
                                 buffer = buffer,
-                                unread = client.unread[buffer.key] ?: 0,
+                                // Muted (NOUNREAD): only real highlights count, as on the web.
+                                unread = if (client.isUnreadMuted(buffer)) {
+                                    client.highlights[buffer.key] ?: 0
+                                } else {
+                                    client.unread[buffer.key] ?: 0
+                                },
                                 highlight = (client.highlights[buffer.key] ?: 0) > 0,
                                 hasDraft = !client.drafts[buffer.key].isNullOrBlank(),
                                 pinned = client.isPinned(buffer),
-                                notifyAll = client.isNotifyAlways(buffer),
-                                muted = client.isNotifyMuted(buffer),
-                                showNetwork = section.network == "★ Pinned" || isFriendRow ||
-                                    section.network == "💬 New queries",
+                                notifyLevel = client.notifyLevel(buffer),
+                                showNetwork = netId == null && (
+                                    section.network == "★ Pinned" || isFriendRow ||
+                                        section.network == "💬 New queries"
+                                    ),
                                 // Green lock, matching the chat header (see e2eFlag above).
                                 e2e = e2eFlag,
                                 // "" (not null) when unknown: the row still shows a
@@ -1788,9 +1862,13 @@ private fun BufferListBody(
                                     isFriendRow -> client.presenceState(buffer.networkId, buffer.target).orEmpty()
                                     else -> null
                                 },
-                                // Favorites carry no display name (2.0 dropped the
-                                // named-contact model) — the row reads the nick.
-                                label = null,
+                                // A DM reads as the peer's IRCv3 display name where
+                                // they set one (Lurker 2.6), as the web's sidebar does.
+                                label = if (buffer.isChannel || buffer.isSystem || buffer.isServerBuffer || buffer.isDccChat) {
+                                    null
+                                } else {
+                                    client.displayNameFor(buffer.networkId, buffer.target)
+                                },
                                 networkName = buffer.networkId?.let { client.networkName(it) },
                                 onTogglePin = if (isFriendRow || buffer.isSystem || buffer.isServerBuffer) null else {
                                     { client.togglePin(buffer) }
@@ -1801,12 +1879,12 @@ private fun BufferListBody(
                                 onToggleFavorite = if (buffer.isSystem || buffer.isServerBuffer || buffer.isDccChat) null else {
                                     { client.toggleFavorite(buffer.networkId, buffer.target) }
                                 },
-                                onToggleNotify = if (buffer.isChannel) {
-                                    { client.setNotifyAlways(buffer, !client.isNotifyAlways(buffer)) }
-                                } else null,
-                                onToggleMute = if (buffer.isChannel) {
-                                    { client.setNotifyMuted(buffer, !client.isNotifyMuted(buffer)) }
-                                } else null,
+                                // Channels and DMs alike (a muted DM counts like a channel, 2.6).
+                                onNotifyLevel = if (buffer.networkId == null || buffer.isSystem || buffer.isServerBuffer || buffer.isDccChat) {
+                                    null
+                                } else {
+                                    { level -> client.setNotifyLevel(buffer, level) }
+                                },
                                 onClick = { onOpen(buffer) },
                                 onClose = if (isFriendRow || buffer.isSystem || buffer.isServerBuffer) null else {
                                     { client.execute(buffer, listOf(WireOp("close"))) }
@@ -1834,7 +1912,11 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
     else -> null
 }
 
-private data class BufferSection(val network: String, val buffers: List<Buffer>)
+/** One titled group in the buffer list. [networkId] is set on a network's own
+ *  group (null for Pinned, Friends, Favorites, New queries and System), which
+ *  keeps its header — name and connection dot — even when every one of its
+ *  buffers is shown in a section above. */
+private data class BufferSection(val network: String, val buffers: List<Buffer>, val networkId: Int? = null)
 
 /**
  * Group buffers by network. Sections follow the user's chosen network order
@@ -1897,6 +1979,11 @@ private fun buildBufferSections(client: LurkerClient): List<BufferSection> {
         .filterNot { it.key in friendKeys }
         .filterNot { it.key in queryKeys }
         .groupBy { it.networkId }
+        .toMutableMap()
+    // Every network keeps its header, as the web's sidebar does — even one whose
+    // buffers all sit in Pinned/Friends/Favorites above, or that has none yet.
+    // Grouping only what was left made such a network vanish from the list.
+    for (id in client.networks.keys) if (id !in byNetwork) byNetwork[id] = emptyList()
     byNetwork.entries
         .sortedWith(
             compareBy(
@@ -1909,6 +1996,7 @@ private fun buildBufferSections(client: LurkerClient): List<BufferSection> {
             out.add(
                 BufferSection(
                     network = networkId?.let { client.networkName(it) } ?: "System",
+                    networkId = networkId,
                     buffers = bufs.sortedWith(
                         compareByDescending<Buffer> { it.isServerBuffer } // Server row leads
                             .thenByDescending { (client.unread[it.key] ?: 0) > 0 }
@@ -1928,8 +2016,9 @@ private fun BufferRow(
     highlight: Boolean,
     hasDraft: Boolean = false,
     pinned: Boolean = false,
-    notifyAll: Boolean = false,
-    muted: Boolean = false,
+    /** Where this buffer sits on the notification ladder ([NOTIFY_RUNGS]), or null
+     *  for a row that has none. */
+    notifyLevel: String? = null,
     showNetwork: Boolean = false,
     e2e: Boolean = false,
     /** Raw presence state for a Friends row ("online"/"away"/"offline"/…), "" when
@@ -1945,13 +2034,12 @@ private fun BufferRow(
      *  channel, one server-side flag behind both labels. */
     favorite: Boolean = false,
     onToggleFavorite: (() -> Unit)? = null,
-    onToggleNotify: (() -> Unit)? = null,
-    onToggleMute: (() -> Unit)? = null,
+    onNotifyLevel: ((String) -> Unit)? = null,
     onClick: () -> Unit,
     onClose: (() -> Unit)? = null,
 ) {
     var menu by remember { mutableStateOf(false) }
-    if (onClose != null || onTogglePin != null || onToggleMute != null || onToggleFavorite != null) {
+    if (onClose != null || onTogglePin != null || onNotifyLevel != null || onToggleFavorite != null) {
         AppDropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             if (onToggleFavorite != null) {
                 val what = if (buffer.isChannel) "Favorites" else "Friends"
@@ -1966,17 +2054,22 @@ private fun BufferRow(
                     onClick = { menu = false; onTogglePin() },
                 )
             }
-            if (onToggleNotify != null) {
-                DropdownMenuItem(
-                    text = { Text(if (notifyAll) "Notify: highlights only" else "Notify on every message") },
-                    onClick = { menu = false; onToggleNotify() },
+            if (onNotifyLevel != null) {
+                // The web's notification ladder (Lurker 2.6), current rung ticked.
+                HorizontalDivider(color = GlassBorder)
+                Text(
+                    "Notifications",
+                    color = TextSecondary,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
-            }
-            if (onToggleMute != null) {
-                DropdownMenuItem(
-                    text = { Text(if (muted) "Unmute notifications" else "Mute notifications") },
-                    onClick = { menu = false; onToggleMute() },
-                )
+                notifyRungs(buffer.isChannel, muteable = true).forEach { (key, label) ->
+                    DropdownMenuItem(
+                        text = { Text((if (notifyLevel == key) "✓ " else "    ") + label) },
+                        onClick = { menu = false; onNotifyLevel(key) },
+                    )
+                }
+                HorizontalDivider(color = GlassBorder)
             }
             if (onClose != null) {
                 DropdownMenuItem(
@@ -2081,7 +2174,7 @@ private sealed interface ChatRow {
 /** All the app's popup menus, styled once: rounded corners, the raised surface
  *  colour, a hairline border and a soft shadow — instead of the stock sharp box. */
 @Composable
-private fun AppDropdownMenu(
+internal fun AppDropdownMenu(
     expanded: Boolean,
     onDismissRequest: () -> Unit,
     content: @Composable ColumnScope.() -> Unit,
@@ -2129,7 +2222,7 @@ private fun buildChatRows(messages: List<Msg>, dividerAfter: Long?): List<ChatRo
             else -> {
                 val sameGroup = !groupBroke && prevBubble != null &&
                     prevBubble.nick == msg.nick && prevBubble.self == msg.self &&
-                    prevBubble.type == msg.type
+                    prevBubble.type == msg.type && prevBubble.relaySource == msg.relaySource
                 if (sameGroup) {
                     // The row just before this one is always the previous bubble
                     // (anything else resets prevBubble): it's no longer last.
@@ -2217,6 +2310,11 @@ private fun ChatScreen(
     // The quote carries the context, so a DM needs no "nick, " — a channel still
     // gets one so the line reads as addressed to them.
     fun replyTo(m: Msg) {
+        // Threads on: Reply opens the line's thread, where the answer goes.
+        if (client.threadsOn && buffer.isChannel && m.msgid != null) {
+            client.openThread(buffer, m.replyTo?.root ?: m.msgid)
+            return
+        }
         // Under a quote a reply tag would land on the quote line, so it's the
         // plain address in the answer instead.
         val (quotes, answer) = Quote.split(draft.text)
@@ -2258,6 +2356,7 @@ private fun ChatScreen(
     var translateFailed by remember(buffer.key) { mutableStateOf(false) }
     var translating by remember(buffer.key) { mutableStateOf(false) }
     var showChannelPanel by remember { mutableStateOf(false) }
+    var showThreadList by remember(buffer.key) { mutableStateOf(false) }
     // Message whose long-press action sheet is open, if any.
     var actionMsg by remember(buffer.key) { mutableStateOf<Msg?>(null) }
     val messages = client.messagesByBuffer[buffer.key] ?: emptyList()
@@ -2290,15 +2389,34 @@ private fun ChatScreen(
     // and works in direct mode too. Only the RENDER is filtered — tail-following,
     // paging and unread still reason about every message.
     val eventTier = client.eventFilterTier
-    val visible = remember(messages, eventTier) {
-        if (eventTier == "all") {
-            messages
+    // This network's relay-bot marks: a mark set or cleared re-reads every line.
+    val relayMarks = buffer.networkId?.let { id -> client.relayBots.values.filter { it.networkId == id } }.orEmpty()
+    // Display names (IRCv3 metadata, Lurker 2.6), likewise re-read when one changes.
+    val showDisplayNames = client.settingBool("look.nick.display_names", true)
+    val netMeta = buffer.networkId?.let { id ->
+        if (showDisplayNames) client.userMetadata.filterKeys { it.startsWith("$id::") } else null
+    }.orEmpty()
+    // Reply threads on (Lurker 2.6): a channel's replies live in their thread.
+    val hideThreadReplies = client.threadsOn && buffer.isChannel
+    val visible = remember(messages, eventTier, relayMarks, netMeta, hideThreadReplies) {
+        val shownMessages = if (hideThreadReplies) messages.filter { it.replyTo?.root == null } else messages
+        val filtered = if (eventTier == "all") {
+            shownMessages
         } else {
             val speakers = messages.asSequence()
                 .filter { it.type == "message" || it.type == "action" || it.type == "notice" }
                 .map { it.nick.lowercase() }
                 .toSet()
-            messages.filter { passesEventFilter(it.type, it.nick, it.self, eventTier, speakers) }
+            shownMessages.filter { passesEventFilter(it.type, it.nick, it.self, eventTier, speakers) }
+        }
+        // A marked relay bot's lines, as the person inside each envelope; then
+        // display names where people set one (a relayed speaker has no metadata).
+        val relayed = if (relayMarks.isEmpty()) filtered else filtered.map { client.relayDisplay(buffer.networkId, it) }
+        if (netMeta.isEmpty()) relayed else relayed.map { m ->
+            if (m.system || m.relayBot != null || m.nick.isEmpty()) m
+            // netMeta is only non-empty with the setting on, so read the record directly.
+            else netMeta["${buffer.networkId}::${m.nick.lowercase()}"]?.shownName
+                ?.takeIf { it != m.nick }?.let { m.copy(displayName = it) } ?: m
         }
     }
     val rows = remember(visible, divider) { buildChatRows(visible, divider) }
@@ -2690,6 +2808,35 @@ private fun ChatScreen(
             is XdccCommand.Error -> note(cmd.message)
         }
     }
+    /** /relay (Lurker #277): marks are per network and server-held; the answer
+     *  comes back as `relay-bot-updated`, so the lines re-read on their own. */
+    fun runRelay(cmd: RelayCommand) {
+        fun note(text: String) = client.localNotice(buffer, text)
+        val nid = buffer.networkId ?: return note("Relay bots are per network — use /relay from one of that network's buffers.")
+        when (cmd) {
+            RelayCommand.List -> {
+                val marks = client.relayBotsFor(nid)
+                note(
+                    if (marks.isEmpty()) "No relay bots marked on this network. /relay add <nick>"
+                    else "Relay bots (${marks.size}):\n" + marks.joinToString("\n") { m ->
+                        "  ${m.nick}" + if (m.pattern.isNotBlank()) " — ${m.pattern}" else " — built-in formats"
+                    },
+                )
+            }
+            is RelayCommand.Add -> {
+                if (cmd.pattern.isNotBlank() && !Relay.isValidTemplate(cmd.pattern)) {
+                    return note("/relay: a pattern needs {nick} and {message} ({source} is optional).")
+                }
+                client.setRelayBot(nid, cmd.nick, true, cmd.pattern)
+                note("Marked ${cmd.nick} as a relay bot" + if (cmd.pattern.isNotBlank()) " (pattern: ${cmd.pattern})." else ".")
+            }
+            is RelayCommand.Remove -> {
+                client.setRelayBot(nid, cmd.nick, false)
+                note("Unmarked ${cmd.nick} as a relay bot.")
+            }
+            is RelayCommand.Error -> note("/relay: ${cmd.message}")
+        }
+    }
     /**
      * Actually put the composer contents on the wire. Split out of the send
      * lambda so the outgoing-translation cycle can reach it: an already-in-
@@ -2735,6 +2882,25 @@ private fun ChatScreen(
             is ParsedInput.Local -> { client.localNotice(buffer, parsed.message); repinToTail() }
             is ParsedInput.Dcc -> { runDcc(parsed.cmd); repinToTail() }
             is ParsedInput.Xdcc -> { runXdcc(parsed.cmd); repinToTail() }
+            is ParsedInput.Relay -> { runRelay(parsed.cmd); repinToTail() }
+            is ParsedInput.Metadata -> {
+                // Your own record can only change on a connected network that keeps
+                // metadata (Lurker 2.6 refuses the same way). Direct mode just sends.
+                val nid = buffer.networkId
+                val refusal = when {
+                    !parsed.write || !client.serverFeatures || nid == null -> null
+                    client.networks[nid]?.connected != true -> "not connected"
+                    client.metadataLimits[nid] == null -> "this network doesn't support IRCv3 metadata"
+                    client.metadataLimits[nid]?.maxKeys == 0 -> "this network doesn't keep metadata for you"
+                    else -> null
+                }
+                if (refusal != null) {
+                    client.localNotice(buffer, "/${text.substringAfter('/').substringBefore(' ')}: $refusal.")
+                } else {
+                    client.execute(buffer, listOf(WireOp("raw", line = parsed.line)))
+                }
+                repinToTail()
+            }
             is ParsedInput.Browse ->
                 // Lurker has a rich channel browser; direct mode falls back
                 // to a raw LIST (results land in the server buffer).
@@ -2882,7 +3048,8 @@ private fun ChatScreen(
             items(rows.size, key = { i -> rowMsgId(rows[i]).let { if (it > 0) "m$it" else "row-$i" } }) { i ->
                 val compact = Ui.compactFor(buffer.key)
                 when (val row = rows[i]) {
-                    is ChatRow.Bubble -> if (compact) {
+                    is ChatRow.Bubble -> Column {
+                    if (compact) {
                         CompactMessageRow(
                             row.msg, baseSize, openLink,
                             translateKey = buffer.key,
@@ -2916,6 +3083,17 @@ private fun ChatScreen(
                         },
                         onRevealEnd = { revealScope.launch { revealAnim.animateTo(0f) } },
                     )
+                    // A line that started a reply thread (threads on): its chip.
+                    val rootId = row.msg.msgid
+                    if (hideThreadReplies && rootId != null && row.msg.threadReplies > 0) {
+                        ThreadChip(
+                            replies = row.msg.threadReplies,
+                            lastTime = row.msg.threadLastTime,
+                            unread = client.followedThread(buffer, rootId)?.unread ?: 0,
+                            alignEnd = row.msg.self && !compact,
+                        ) { client.openThread(buffer, rootId) }
+                    }
+                    }
                     is ChatRow.Action -> Column {
                         if (Ui.compact) CompactActionRow(row.msg, baseSize, openLink) else ActionLine(row.msg, baseSize, openLink)
                         ReactionChips(
@@ -3032,6 +3210,10 @@ private fun ChatScreen(
                                 text = { Text("Translate", color = AccentBlue) },
                                 onClick = { titleMenu = false; showTranslate = true },
                             )
+                            if (buffer.isChannel && client.threadsOn) DropdownMenuItem(
+                                text = { Text("Threads", color = AccentBlue) },
+                                onClick = { titleMenu = false; client.loadThreads(buffer); showThreadList = true },
+                            )
                             // E2E rides IRC; a DCC chat is already a direct socket.
                             if (!buffer.isDccChat) DropdownMenuItem(
                                 text = { Text("Encryption (E2E)", color = OnlineGreen) },
@@ -3123,6 +3305,8 @@ private fun ChatScreen(
             // Pending DCC chat offers, and this `=nick` chat's own connection state.
             // Inside the measured top column so the list's padding follows it.
             if (client.serverFeatures) DccBanner(client, current = buffer, onOpenDcc = onDcc)
+            // Paused account; someone our caller ID turned away (Lurker 2.6).
+            if (client.serverFeatures) AccountBanners(client, current = buffer)
             // Lines Lurker is still spacing out so the server doesn't kick for
             // flooding (2.5): a long paste goes out paced.
             val waitingLines = buffer.networkId?.let { client.sendQueueWaiting[it] } ?: 0
@@ -3219,9 +3403,18 @@ private fun ChatScreen(
                         }
                     },
                     target = buffer.displayName,
+                    placeholder = if (client.accountPaused) "Account paused — read only" else null,
                     uploading = client.uploading,
-                    onPickFile = { uploadPicker.launch("*/*") },
-                    onTakePhoto = { launchCamera() },
+                    // An account kept off the uploaders (Lurker 2.6) says so instead
+                    // of picking a file the server would refuse.
+                    onPickFile = {
+                        if (client.uploadsAllowed) uploadPicker.launch("*/*")
+                        else android.widget.Toast.makeText(context, "Uploads are not enabled for this account.", android.widget.Toast.LENGTH_SHORT).show()
+                    },
+                    onTakePhoto = {
+                        if (client.uploadsAllowed) launchCamera()
+                        else android.widget.Toast.makeText(context, "Uploads are not enabled for this account.", android.widget.Toast.LENGTH_SHORT).show()
+                    },
                     suggestions = suggestions,
                     onPickSuggestion = { draft = applySuggestion(it); client.setDraftLocal(buffer, draft.text) },
                     // Long-press send = post exactly what's typed, no translation.
@@ -3388,6 +3581,10 @@ private fun ChatScreen(
         )
     }
 
+    // The open reply thread, and this channel's thread list (Lurker 2.6).
+    ThreadSheet(client, buffer, onLink = openLink)
+    if (showThreadList) ThreadListSheet(client, buffer) { showThreadList = false }
+
     actionMsg?.let { m ->
         MessageActions(
             msg = m,
@@ -3415,11 +3612,19 @@ private fun ChatScreen(
                 actionMsg = null
             },
             onWhois = if (buffer.networkId != null) {
-                {
-                    client.execute(buffer, listOf(WireOp("raw", line = "WHOIS ${m.nick}")))
+                { who ->
+                    client.execute(buffer, listOf(WireOp("raw", line = "WHOIS $who")))
                     actionMsg = null
                 }
             } else null,
+            onRelay = buffer.networkId?.let { net ->
+                { nick, mark ->
+                    // Re-marking keeps a custom pattern; a fresh mark uses the defaults.
+                    client.setRelayBot(net, nick, mark, client.relayBot(net, nick)?.pattern.orEmpty())
+                    actionMsg = null
+                }
+            },
+            relayNetworkId = buffer.networkId,
             onDismiss = { actionMsg = null },
         )
     }
@@ -3551,7 +3756,10 @@ private fun MemberSheet(
                     modifier = Modifier.fillMaxWidth().padding(24.dp),
                 )
             }
-            RosterList(roster, Modifier.heightIn(max = 460.dp), client.serverInfo[buffer.networkId ?: -1]?.prefixes) { selected = it }
+            RosterList(
+                roster, Modifier.heightIn(max = 460.dp), client.serverInfo[buffer.networkId ?: -1]?.prefixes,
+                nameFor = { client.displayNameFor(buffer.networkId, it) },
+            ) { selected = it }
         } else {
             MemberActions(
                 client = client,
@@ -3575,6 +3783,8 @@ private fun RosterList(
     modifier: Modifier = Modifier,
     /** The network's PREFIX ladder, when it advertised one. */
     ladder: List<Pair<Char, Char>>? = null,
+    /** A nick's display name to show instead (Lurker 2.6), or null. */
+    nameFor: (String) -> String? = { null },
     onSelect: (Member) -> Unit,
 ) {
     LazyColumn(modifier) {
@@ -3599,9 +3809,11 @@ private fun RosterList(
                     modifier = Modifier.widthIn(min = 20.dp),
                 )
                 Text(
-                    m.nick,
+                    nameFor(m.nick) ?: m.nick,
                     color = nickColor(m.nick).copy(alpha = if (m.away) 0.45f else 1f),
                     fontSize = 16.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
                 if (m.away) Text("away", color = TextSecondary, fontSize = 12.sp)
@@ -3648,7 +3860,10 @@ private fun MemberPane(
                     modifier = Modifier.fillMaxWidth().padding(22.dp),
                 )
             }
-            RosterList(roster, Modifier.fillMaxSize(), client.serverInfo[buffer.networkId ?: -1]?.prefixes) { selected = it }
+            RosterList(
+                roster, Modifier.fillMaxSize(), client.serverInfo[buffer.networkId ?: -1]?.prefixes,
+                nameFor = { client.displayNameFor(buffer.networkId, it) },
+            ) { selected = it }
         } else {
             MemberActions(
                 client = client,
@@ -3730,6 +3945,10 @@ private fun MemberActions(
                 )
             }
         }
+        // Their IRCv3 profile (Lurker 2.6): avatar, display name, pronouns…
+        client.userMeta(networkId, nick)?.let { meta ->
+            ProfileMetaBlock(nick, meta, Modifier.padding(horizontal = 26.dp, vertical = 6.dp))
+        }
         client.nickNote(networkId, nick)?.let { note ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -3739,6 +3958,17 @@ private fun MemberActions(
                 Spacer(Modifier.width(6.dp))
                 Text(note, color = TextSecondary, fontSize = 13.sp)
             }
+        }
+        val relay = client.relayBot(networkId, nick)
+        if (relay != null) {
+            Text(
+                "Relay bot" + if (relay.pattern.isNotBlank()) " · ${relay.pattern}" else "",
+                color = AccentBlue,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 26.dp, vertical = 4.dp),
+            )
         }
         SheetAction("Whois") { raw("WHOIS $nick") }
         SheetAction("Send a message") {
@@ -3757,6 +3987,14 @@ private fun MemberActions(
         }
         SheetAction("Ignore (everything)", danger = true) {
             client.addIgnore(networkId, member.banMask, levels = listOf("ALL")); onDone()
+        }
+        // A bridge bot's lines then read as the person inside each envelope.
+        // Custom formats live in Settings › Relay bots (or /relay add <nick> <pattern>).
+        if (!nick.equals(client.networks[networkId]?.nick, ignoreCase = true)) {
+            SheetAction(if (relay != null) "Unmark relay bot" else "Mark as relay bot") {
+                client.setRelayBot(networkId, nick, relay == null, relay?.pattern.orEmpty())
+                onDone()
+            }
         }
         // DCC SEND: upstream's grant (newer Lurker) or the fork's own route.
         if (client.dccCanSend) {
@@ -3828,7 +4066,11 @@ private fun MessageActions(
     onReply: () -> Unit,
     onQuote: () -> Unit,
     // Null on the :system: buffer, where there's no network to ask.
-    onWhois: (() -> Unit)? = null,
+    onWhois: ((String) -> Unit)? = null,
+    // Mark/unmark a nick as a relay bot on this line's network; null where marks
+    // don't exist (direct mode, the :system: buffer).
+    onRelay: ((nick: String, mark: Boolean) -> Unit)? = null,
+    relayNetworkId: Int? = null,
     onDismiss: () -> Unit,
     // IRCv3 reactions (Lurker 2.4+); null where this line can't take one.
     onReact: ((String) -> Unit)? = null,
@@ -3903,13 +4145,34 @@ private fun MessageActions(
             clipboard.setText(AnnotatedString(msg.text))
             onDismiss()
         }
+        // `<bob> hi`, for quoting by hand or pasting elsewhere (Lurker 2.6).
+        if (msg.nick.isNotBlank() && msg.text.isNotBlank()) {
+            SheetAction("Copy quote") {
+                clipboard.setText(AnnotatedString(Quote.copyText(msg.nick, msg.type, msg.text)))
+                onDismiss()
+            }
+        }
         SheetAction("Reply") { onReply() }
         SheetAction("Quote") { onQuote() }
         // Long-press → whois the sender; reply stays a short press (freakyy85).
         // Also covers "whois the person I'm in a query with", since their lines
-        // are the ones you'd long-press there.
-        if (onWhois != null && !msg.self && msg.nick.isNotBlank()) {
-            SheetAction("Whois ${msg.nick}") { onWhois() }
+        // are the ones you'd long-press there. A relayed speaker has no IRC
+        // presence, so that whois is the bot's — the only real user here.
+        val whoisNick = msg.relayBot ?: msg.nick
+        if (onWhois != null && !msg.self && whoisNick.isNotBlank()) {
+            SheetAction("Whois $whoisNick") { onWhois(whoisNick) }
+        }
+        // Relay bots (Lurker #277): mark the sender, or unmark the bot behind a
+        // relayed line. A relayed speaker can be marked too — a bridge relaying
+        // another bridge — which unwraps the next envelope.
+        if (onRelay != null && !msg.self && msg.type == "message" && msg.nick.isNotBlank()) {
+            msg.relayBot?.let { bot ->
+                SheetAction("Unmark relay bot ($bot)") { onRelay(bot, false) }
+            }
+            val marked = client.isRelayBot(relayNetworkId, msg.nick)
+            SheetAction(if (marked) "Unmark relay bot (${msg.nick})" else "Mark ${msg.nick} as a relay bot") {
+                onRelay(msg.nick, !marked)
+            }
         }
         SheetAction("Share…") {
             val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -4225,11 +4488,19 @@ private fun MessageBubble(
                 modifier = Modifier.padding(start = 14.dp, bottom = 2.dp),
             ) {
                 Text(
-                    msg.nick,
+                    msg.displayName ?: msg.nick,
                     color = nickColor(msg.nick),
                     fontSize = (baseSize - 3).sp,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
+                // A relayed speaker: where they're from, beside the name it qualifies.
+                msg.relaySource?.takeIf { it.isNotBlank() }?.let { src ->
+                    Spacer(Modifier.width(6.dp))
+                    Text("[$src]", color = TextSecondary, fontSize = (baseSize - 4).sp, maxLines = 1)
+                }
                 if (msg.e2e) {
                     Spacer(Modifier.width(6.dp))
                     LockGlyph(color = OnlineGreen, size = (baseSize - 5).dp)
@@ -4403,10 +4674,14 @@ private fun CompactMessageRow(
         val nickStyle = SpanStyle(color = nickColor(msg.nick), fontWeight = FontWeight.SemiBold)
         if (onNickTap != null) {
             withLink(LinkAnnotation.Clickable("nick", linkInteractionListener = { onNickTap() })) {
-                withStyle(nickStyle) { append(msg.nick) }
+                withStyle(nickStyle) { append(msg.displayName ?: msg.nick) }
             }
         } else {
-            withStyle(nickStyle) { append(msg.nick) }
+            withStyle(nickStyle) { append(msg.displayName ?: msg.nick) }
+        }
+        // A relayed speaker's source, beside the nick (as Lurker's compact head).
+        msg.relaySource?.takeIf { it.isNotBlank() }?.let { src ->
+            withStyle(SpanStyle(color = TextSecondary, fontSize = (baseSize - 3).sp)) { append(" $src") }
         }
         append("  ")
         if (badge.isNotEmpty()) {
@@ -4727,7 +5002,8 @@ private fun MultichanScreen(
             val buf = client.buffers.find { it.key == key } ?: return@forEach
             val msgs = client.messagesByBuffer[key] ?: return@forEach
             msgs.asReversed().take(250).forEach { m ->
-                if (!m.system && m.text.isNotBlank()) add(buf to m)
+                // A marked relay bot's line reads as its speaker here too.
+                if (!m.system && m.text.isNotBlank()) add(buf to client.relayDisplay(buf.networkId, m))
             }
         }
     }.sortedBy { it.second.time ?: "" }.takeLast(500)
@@ -5489,6 +5765,8 @@ private fun Composer(
     draft: TextFieldValue,
     onChange: (TextFieldValue) -> Unit,
     target: String,
+    /** Overrides "Message <target>" (e.g. a paused account's read-only note). */
+    placeholder: String? = null,
     uploading: Boolean = false,
     onPickFile: (() -> Unit)? = null,
     onTakePhoto: (() -> Unit)? = null,
@@ -5610,7 +5888,7 @@ private fun Composer(
             }
             TextField(
                 state = field,
-                placeholder = { Text("Message $target", color = TextSecondary) },
+                placeholder = { Text(placeholder ?: "Message $target", color = TextSecondary) },
                 shape = RoundedCornerShape(22.dp),
                 colors = TextFieldDefaults.colors(
                     focusedContainerColor = SurfaceDark,
@@ -7134,7 +7412,7 @@ private fun NetworksScreen(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun NetworkEditScreen(client: LurkerClient, config: NetworkConfig?, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
@@ -7150,6 +7428,7 @@ private fun NetworkEditScreen(client: LurkerClient, config: NetworkConfig?, onBa
     var saslPassword by remember { mutableStateOf("") }
     var channels by remember { mutableStateOf("") }
     var autoconnect by remember { mutableStateOf(config?.autoconnect ?: true) }
+    var floodProtection by remember { mutableStateOf(config?.floodProtection ?: true) }
     // Direct-mode endpoint type: a plain network, or a soju bouncer (which
     // auto-discovers its upstream networks). Only meaningful in direct mode.
     val directMode = !client.serverFeatures
@@ -7177,8 +7456,37 @@ private fun NetworkEditScreen(client: LurkerClient, config: NetworkConfig?, onBa
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             error?.let { Text(it, color = AlertRed, fontSize = 13.sp) }
+            // An account held to a list of hosts (Lurker 2.6) is offered just those,
+            // and no host of its own; anyone else gets a few one-tap presets.
+            val allowed = client.allowedHosts.takeIf { !directMode }
+            if (config == null) {
+                val presets = allowed?.map { h ->
+                    NETWORK_PRESETS.firstOrNull { it.host.equals(h, true) } ?: NetworkPreset(h, h)
+                } ?: NETWORK_PRESETS
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    presets.forEach { p ->
+                        val sel = host.equals(p.host, true)
+                        Text(
+                            p.name,
+                            color = if (sel) AccentBlue else TextSecondary,
+                            fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal,
+                            fontSize = 14.sp,
+                            modifier = Modifier
+                                .background(if (sel) SurfaceRaised else SurfaceDark, RoundedCornerShape(14.dp))
+                                .clickable {
+                                    name = p.name; host = p.host; port = p.port.toString(); tls = p.tls
+                                    if (channels.isBlank()) channels = p.channel.orEmpty()
+                                }
+                                .padding(12.dp, 8.dp),
+                        )
+                    }
+                }
+                if (allowed != null) {
+                    Text("This account can only connect to the networks listed above.", color = TextSecondary, fontSize = 12.sp)
+                }
+            }
             FormField("Name", name) { name = it }
-            FormField("Host", host) { host = it }
+            if (allowed == null || config != null) FormField("Host", host) { host = it }
             FormField("Port", port, number = true) { port = it }
             Row(
                 Modifier.fillMaxWidth(),
@@ -7237,6 +7545,24 @@ private fun NetworkEditScreen(client: LurkerClient, config: NetworkConfig?, onBa
                 Text("Connect automatically")
                 Switch(checked = autoconnect, onCheckedChange = { autoconnect = it })
             }
+            // Lurker 2.6: pace lines against the server's flood clock (#1193).
+            if (!directMode) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Flood protection")
+                    Switch(checked = floodProtection, onCheckedChange = { floodProtection = it })
+                }
+                if (!floodProtection) {
+                    Text(
+                        "Lines go out as fast as you send them. Only for a network that exempts you, or a " +
+                            "bouncer that paces upstream itself; elsewhere the server disconnects you for flooding.",
+                        color = TextSecondary, fontSize = 12.sp,
+                    )
+                }
+            }
             Button(
                 onClick = {
                     saving = true
@@ -7254,6 +7580,9 @@ private fun NetworkEditScreen(client: LurkerClient, config: NetworkConfig?, onBa
                         if (config == null && channels.isNotBlank()) put("default_channel", channels)
                         put("autoconnect", autoconnect)
                         if (directMode) put("type", endpointType)
+                        // Only when it's off or being turned back on: an older server
+                        // never sees a field it doesn't know.
+                        else if (!floodProtection || config?.floodProtection == false) put("flood_protection", floodProtection)
                     }
                     client.saveNetwork(config?.id, fields) { err ->
                         saving = false

@@ -65,6 +65,15 @@ object Quote {
         return "$head ${clip(flat, room).trimEnd()}…"
     }
 
+    /** What Copy quote copies (Lurker 2.6): the Quote line without the `> ` or the
+     *  wire budget — `<alice> what she said`, read by the same rules. */
+    fun copyText(nick: String, type: String, text: String): String {
+        val (open, close) = marks(type)
+        val head = "$open$nick$close"
+        val flat = Mirc.strip(text).replace(Regex("\\s*\\n\\s*"), " ").trim()
+        return if (flat.isEmpty()) head else "$head $flat"
+    }
+
     /** A draft's leading quote lines (each `> …` and complete) and the answer under them. */
     fun split(draft: String): Pair<String, String> {
         val quotes = Regex("^(?:> [^\\n]*\\n)*").find(draft)?.value.orEmpty()

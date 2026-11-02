@@ -688,9 +688,9 @@ internal fun DccBanner(client: LurkerClient, current: Buffer?, onOpenDcc: () -> 
                     (if (many && t.networkId != null) " · ${client.networkName(t.networkId)}" else "") +
                     (if (cantTake) " — they're firewalled, and your server can't take a passive offer" else ""),
                 primary = if (client.dccCanReceive && !cantTake) "Accept" else null,
-                onPrimary = { client.dccAccept(t.id) },
+                onPrimary = { client.dccAccept(t.id, current) },
                 secondary = "Decline",
-                onSecondary = { client.dccReject(t.id) },
+                onSecondary = { client.dccReject(t.id, current) },
                 tertiary = "Later",
                 onTertiary = { client.dccOffersLater.add(t.id) },
             )
@@ -723,7 +723,7 @@ internal fun DccBanner(client: LurkerClient, current: Buffer?, onOpenDcc: () -> 
 }
 
 @Composable
-private fun DccStrip(
+internal fun DccStrip(
     text: String,
     primary: String?,
     onPrimary: () -> Unit,

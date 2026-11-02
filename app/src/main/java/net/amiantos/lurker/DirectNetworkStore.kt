@@ -113,9 +113,9 @@ class DirectNetworkStore(context: Context) {
             IgnoreRule(
                 id = o.optLong("id"),
                 networkId = if (o.has("networkId")) o.optInt("networkId") else null,
-                mask = o.optString("mask").ifEmpty { null },
+                mask = o.str("mask"),
                 channels = o.optJSONArray("channels")?.let { c -> (0 until c.length()).map { c.optString(it) } },
-                pattern = o.optString("pattern").ifEmpty { null },
+                pattern = o.str("pattern"),
                 patternKind = o.optString("patternKind").ifEmpty { "substr" },
                 levels = o.optJSONArray("levels")?.let { l -> (0 until l.length()).map { l.optString(it) } } ?: emptyList(),
                 isExcept = o.optBoolean("isExcept"),
@@ -160,9 +160,9 @@ class DirectNetworkStore(context: Context) {
                 Msg(
                     id = m.optLong("id"), type = m.optString("type"), nick = m.optString("nick"),
                     text = m.optString("text"), self = m.optBoolean("self"),
-                    time = m.optString("time").ifEmpty { null }, system = m.optBoolean("system"),
-                    level = m.optString("level").ifEmpty { null }, e2e = m.optBoolean("e2e"),
-                    msgid = m.optString("msgid").ifEmpty { null },
+                    time = m.str("time"), system = m.optBoolean("system"),
+                    level = m.str("level"), e2e = m.optBoolean("e2e"),
+                    msgid = m.str("msgid"),
                 )
             }
             PersistedBuffer(
@@ -172,6 +172,23 @@ class DirectNetworkStore(context: Context) {
                 msgs = msgs,
             )
         }
+    }
+
+    // ---- Relay-bot marks (Lurker keeps them server-side; here they're local) --
+    fun loadRelayBots(): List<RelayBot> {
+        val arr = runCatching { JSONArray(sp.getString("relayBots", null) ?: return emptyList()) }.getOrNull()
+            ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            val nick = o.str("nick") ?: return@mapNotNull null
+            RelayBot(o.optInt("networkId"), nick, o.optString("pattern"))
+        }
+    }
+
+    fun saveRelayBots(marks: List<RelayBot>) {
+        val arr = JSONArray()
+        marks.forEach { arr.put(JSONObject().put("networkId", it.networkId).put("nick", it.nick).put("pattern", it.pattern)) }
+        sp.edit { putString("relayBots", arr.toString()) }
     }
 
     fun saveIgnores(rules: List<IgnoreRule>) {
@@ -221,12 +238,12 @@ class DirectNetworkStore(context: Context) {
         port = o.optInt("port", 6697),
         tls = o.optBoolean("tls", true),
         nick = o.optString("nick"),
-        username = o.optString("username").ifEmpty { null },
-        realname = o.optString("realname").ifEmpty { null },
-        serverPassword = o.optString("serverPassword").ifEmpty { null },
-        saslAccount = o.optString("saslAccount").ifEmpty { null },
-        saslPassword = o.optString("saslPassword").ifEmpty { null },
-        channels = o.optString("channels").ifEmpty { null },
+        username = o.str("username"),
+        realname = o.str("realname"),
+        serverPassword = o.str("serverPassword"),
+        saslAccount = o.str("saslAccount"),
+        saslPassword = o.str("saslPassword"),
+        channels = o.str("channels"),
         autoconnect = o.optBoolean("autoconnect", true),
         type = o.optString("type").ifEmpty { "direct" },
     )

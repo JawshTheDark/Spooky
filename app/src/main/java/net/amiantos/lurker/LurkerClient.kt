@@ -193,6 +193,51 @@ open class LurkerClient {
     /** "networkId::nick" -> free-form nick note. */
     val nickNotes = mutableStateMapOf<String, String>()
 
+    /** "networkId::nicklower" -> a relay/bridge-bot mark (Lurker #277). Server-held;
+     *  the snapshot seeds each network's set and `relay-bot-updated` keeps it. */
+    val relayBots = mutableStateMapOf<String, RelayBot>()
+
+    /** "networkId::nicklower" -> that nick's IRCv3 metadata (Lurker 2.6, #607):
+     *  display name, avatar, pronouns, homepage, status. */
+    val userMetadata = mutableStateMapOf<String, UserMeta>()
+
+    /** "networkId::#channellower" -> a channel's own metadata record. */
+    val channelMetadata = mutableStateMapOf<String, UserMeta>()
+
+    /** networkId -> the network's metadata limits; absent when it has no
+     *  draft/metadata-2 (or the server predates it). */
+    val metadataLimits = mutableStateMapOf<Int, MetadataLimits>()
+
+    /** Reply threads the user follows, with their own unread counts (Lurker 2.6). */
+    val followedThreads = mutableStateListOf<FollowedThread>()
+
+    /** The thread open in the thread sheet, if any. */
+    var threadView by mutableStateOf<ThreadView?>(null)
+        private set
+
+    /** The open buffer's threads (the "Threads" list), null until asked for. */
+    var threadList by mutableStateOf<List<ThreadSummary>?>(null)
+        private set
+    private var threadToken = 0
+    private var threadListToken = 0
+
+    /** Server buffer ids by buffer key: the thread verbs name a buffer by id. */
+    private val bufferIds = HashMap<String, Int>()
+
+    /** People our caller ID (+g) turned away, newest last, until accepted or dismissed. */
+    val callerIdBlocked = mutableStateListOf<CallerIdBlock>()
+
+    /** The account is paused (hosted billing): read-only until reactivated. */
+    var accountPaused by mutableStateOf(false)
+        private set
+
+    /** Account restrictions (Lurker 2.6): uploads off, and/or the IRC hosts this
+     *  account may connect to (null = any the instance allows). */
+    var uploadsAllowed by mutableStateOf(true)
+        private set
+    var allowedHosts by mutableStateOf<List<String>?>(null)
+        private set
+
     /** "networkId::#target" -> notify-always flag. */
     val notifyAlways = mutableStateMapOf<String, Boolean>()
 
@@ -494,6 +539,10 @@ open class LurkerClient {
 
     protected val main = Handler(Looper.getMainLooper())
     protected val io = Executors.newSingleThreadExecutor()
+
+    /** Uploads (chat files, DCC sends) on their own thread: a big one can run for
+     *  minutes, and on [io] it held up every DCC answer, chat and setting behind it. */
+    private val uploadIo = Executors.newSingleThreadExecutor()
     private val json = "application/json; charset=utf-8".toMediaType()
 
     @Volatile private var ws: WebSocket? = null
@@ -722,6 +771,18 @@ open class LurkerClient {
             presence.clear()
             pins.clear()
             nickNotes.clear()
+            relayBots.clear()
+            userMetadata.clear()
+            channelMetadata.clear()
+            metadataLimits.clear()
+            callerIdBlocked.clear()
+            followedThreads.clear()
+            threadView = null
+            threadList = null
+            bufferIds.clear()
+            accountPaused = false
+            uploadsAllowed = true
+            allowedHosts = null
             notifyAlways.clear()
             topics.clear()
             channelModes.clear()
@@ -1103,7 +1164,7 @@ open class LurkerClient {
                     val net = Network(
                         id = id,
                         name = name,
-                        nick = n.optString("nick").ifEmpty { null },
+                        nick = n.str("nick"),
                         connected = n.optBoolean("connected", n.optString("state") == "connected"),
                     )
                     post { networks[id] = net }
@@ -1353,6 +1414,7 @@ open class LurkerClient {
                 val target = frame.optString("target")
                 if (target.isEmpty()) return
                 val buffer = ensureBuffer(networkId, target)
+                noteBufferId(buffer.key, frame)
                 burstSeen.add(buffer.key)
                 val events = frame.optJSONArray("events")
                 bumpCursorFromEvents(events)
@@ -1426,6 +1488,40 @@ open class LurkerClient {
                         if (networkId != null) applyDccChatEvent(networkId, frame)
                         return
                     }
+                    // IRCv3 metadata (Lurker 2.6): a nick's whole record, or null to
+                    // forget it. Aimed at the :server: pseudo-buffer — never a row,
+                    // and never a reason to create a buffer.
+                    "user-metadata" -> {
+                        val nick = frame.optString("nick")
+                        if (networkId != null && nick.isNotEmpty()) {
+                            val key = "$networkId::${nick.lowercase()}"
+                            val meta = if (frame.isNull("values")) null else UserMeta.parse(frame.optJSONObject("values"))
+                            if (meta == null) userMetadata.remove(key) else userMetadata[key] = meta
+                        }
+                        return
+                    }
+                    // A channel's own record (display name, avatar): state only, and
+                    // only for a channel we hold — resolve or drop.
+                    "channel-metadata" -> {
+                        val target = frame.optString("target")
+                        if (networkId != null && buffers.any { it.key == "$networkId::$target" }) {
+                            val meta = UserMeta.parse(frame.optJSONObject("values"))
+                            if (meta == null) channelMetadata.remove("$networkId::${target.lowercase()}")
+                            else channelMetadata["$networkId::${target.lowercase()}"] = meta
+                        }
+                        return
+                    }
+                    // Our caller ID (+g) dropped someone's message: offer to accept them,
+                    // as the web's toast does. The server logs the line itself.
+                    "callerid-blocked" -> {
+                        val from = frame.optString("from")
+                        if (networkId != null && from.isNotEmpty()) {
+                            callerIdBlocked.removeAll { it.networkId == networkId && it.nick.equals(from, true) }
+                            callerIdBlocked.add(CallerIdBlock(networkId, from))
+                            while (callerIdBlocked.size > 5) callerIdBlocked.removeAt(0)
+                        }
+                        return
+                    }
                 }
                 val target = frame.optString("target")
                 if (target.isEmpty()) return
@@ -1435,7 +1531,7 @@ open class LurkerClient {
                 if (frame.optString("type") == "channel-topic") {
                     if (networkId != null) {
                         val key = "$networkId::$target"
-                        val t = frame.optString("topic")
+                        val t = frame.str("topic").orEmpty()
                         if (t.isEmpty()) topics.remove(key) else topics[key] = t
                     }
                     return
@@ -1467,7 +1563,7 @@ open class LurkerClient {
                     // A live change: keep the topic bar current (still falls through
                     // to render the "X set the topic" system line below).
                     val key = "$networkId::$target"
-                    val t = frame.optString("text").ifEmpty { frame.optString("reason") }
+                    val t = frame.str("text") ?: frame.str("reason").orEmpty()
                     if (t.isEmpty()) topics.remove(key) else topics[key] = t
                 }
                 // Typing is ephemeral and must not create buffers — handle it
@@ -1522,6 +1618,14 @@ open class LurkerClient {
                     return
                 }
                 bumpCursor(frame.optLong("id"))
+                // A line from someone ignored is dropped (parseEvent), so it mustn't
+                // open a buffer on its way there: an ignored nick's first DM left an
+                // empty conversation behind (fixed the same way in Lurker 2.6).
+                if (frame.optBoolean("fromIgnored", false) &&
+                    buffers.none { it.key == "${networkId ?: "sys"}::$target" }
+                ) {
+                    return
+                }
                 val buffer = ensureBuffer(networkId, target)
                 // Roster updates ride the same stream; apply before the renderable
                 // check (names/channel-parted produce no chat line at all).
@@ -1530,7 +1634,9 @@ open class LurkerClient {
                 val msg = parseEvent(frame) ?: return
                 // A re-delivered message (e.g. the boundary id on a ?since= resume)
                 // is deduped by mergeInto — don't re-count its badge or re-notify.
+                noteBufferId(buffer.key, frame)
                 if (!mergeInto(buffer.key, listOf(msg), replace = false)) return
+                msg.replyTo?.root?.let { root -> bumpThread(buffer.key, root, msg) }
                 countUnread(buffer.key, frame, msg)
                 if (msg.id > 0) scheduleMarkRead(buffer.key)
                 if (shouldNotify(frame.optBoolean("notify", false), buffer.key == activeKey, msg.self, msg.system, msg.id > 0, appForeground) &&
@@ -1655,6 +1761,20 @@ open class LurkerClient {
                 val key = "${frame.optInt("networkId")}::${frame.optString("target")}"
                 if (frame.optBoolean("notifyAlways")) notifyAlways[key] = true else notifyAlways.remove(key)
             }
+            // A relay-bot mark set or cleared, from any device; `nick` is the
+            // server's casing.
+            "relay-bot-updated" -> {
+                val networkId = frame.optInt("networkId", -1)
+                val nick = frame.optString("nick")
+                if (networkId >= 0 && nick.isNotEmpty()) {
+                    val key = "$networkId::${nick.lowercase()}"
+                    if (frame.optBoolean("marked")) {
+                        relayBots[key] = RelayBot(networkId, nick, frame.optString("pattern"))
+                    } else {
+                        relayBots.remove(key)
+                    }
+                }
+            }
             "nick-note-updated" -> {
                 val key = "${frame.optInt("networkId")}::${frame.optString("nick").lowercase()}"
                 val note = frame.optString("note")
@@ -1735,6 +1855,7 @@ open class LurkerClient {
                 val target = frame.optString("target")
                 if (target.isEmpty()) return
                 val key = "${networkId ?: "sys"}::$target"
+                noteBufferId(key, frame)
                 loadingOlder.remove(key)
                 if (frame.has("hasMoreOlder")) hasMoreOlder[key] = frame.optBoolean("hasMoreOlder")
                 // A mode:'latest' hydrate carries the buffer's recall list, and it's
@@ -1752,7 +1873,66 @@ open class LurkerClient {
                 if (older.isNotEmpty()) messagesByBuffer[key] = ensureOrdered(older + existing)
             }
 
+            // Reply threads (Lurker 2.6): the threads the user follows, whole.
+            "threads-changed" -> {
+                val arr = frame.optJSONArray("threads")
+                val list = ArrayList<FollowedThread>()
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val t = arr.optJSONObject(i) ?: continue
+                    val root = t.str("rootMsgid") ?: continue
+                    list.add(
+                        FollowedThread(
+                            t.optInt("networkId"), t.optString("target"), t.optInt("bufferId"), root,
+                            t.optInt("unread", 0), t.optBoolean("highlighted", false),
+                        ),
+                    )
+                }
+                followedThreads.clear()
+                followedThreads.addAll(list)
+            }
+            // The answer to `thread`: the root line and every reply, oldest first.
+            "thread" -> {
+                val tv = threadView ?: return
+                if (frame.optInt("token", -1) != tv.token) return
+                val root = frame.optJSONObject("root")?.let(::parseEvent)
+                val replies = parseEvents(frame.optJSONArray("replies"))
+                threadView = tv.copy(
+                    root = root ?: tv.root,
+                    replies = replies,
+                    truncated = frame.optBoolean("truncated", false),
+                    loading = false,
+                )
+                markThreadRead()
+            }
+            // The answer to `threads`: a buffer's threads by last activity.
+            "threads" -> {
+                if (frame.optInt("token", -1) != threadListToken) return
+                val arr = frame.optJSONArray("threads")
+                val list = ArrayList<ThreadSummary>()
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val t = arr.optJSONObject(i) ?: continue
+                    val root = t.str("rootMsgid") ?: continue
+                    list.add(ThreadSummary(root, parseReplyParent(t.optJSONObject("root")), t.optInt("replies", 0), t.str("lastReplyTime")))
+                }
+                threadList = list
+            }
+
+            // Paused (hosted billing) and account restrictions. Rides every connect
+            // burst right behind the snapshot; `restrictions` only when present.
+            "account-state" -> {
+                accountPaused = frame.optBoolean("paused", false)
+                frame.optJSONObject("restrictions")?.let(::applyRestrictions)
+            }
+
             "error" -> status = frame.optString("text")
+        }
+    }
+
+    /** `{networks: string[]|null, uploads: bool}`; a missing field is unrestricted. */
+    private fun applyRestrictions(r: JSONObject) {
+        uploadsAllowed = r.optBoolean("uploads", true)
+        allowedHosts = r.optJSONArray("networks")?.let { a ->
+            (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }
         }
     }
 
@@ -2019,7 +2199,7 @@ open class LurkerClient {
             networks[id] = Network(
                 id = id,
                 name = name,
-                nick = n.optString("nick").ifEmpty { null },
+                nick = n.str("nick"),
                 connected = n.optBoolean("connected", n.optString("state") == "connected"),
             )
             // ISUPPORT vocabulary carried in the snapshot (patched server); null
@@ -2077,6 +2257,15 @@ open class LurkerClient {
                     if (nk.isNotEmpty() && body.isNotEmpty()) nickNotes["$id::${nk.lowercase()}"] = body
                 }
             }
+            // Relay-bot marks, {nick, pattern}: the network's whole set, so replace it.
+            n.optJSONArray("relayBots")?.let { marks ->
+                relayBots.keys.filter { it.startsWith("$id::") }.forEach { relayBots.remove(it) }
+                for (i in 0 until marks.length()) {
+                    val rb = marks.optJSONObject(i) ?: continue
+                    val nk = rb.optString("nick")
+                    if (nk.isNotEmpty()) relayBots["$id::${nk.lowercase()}"] = RelayBot(id, nk, rb.optString("pattern"))
+                }
+            }
             // channelNotify: { "#target": { notifyAlways } }.
             n.optJSONObject("channelNotify")?.let { cn ->
                 for (t in cn.keys()) {
@@ -2094,6 +2283,18 @@ open class LurkerClient {
                     if (!st.isNullOrEmpty()) presence["$id::${nk.lowercase()}"] = st
                 }
             }
+            // IRCv3 metadata (Lurker 2.6): every nick's record the connection
+            // holds, keyed like peerPresence — the network's whole set.
+            n.optJSONObject("userMetadata")?.let { um ->
+                userMetadata.keys.filter { it.startsWith("$id::") }.forEach { userMetadata.remove(it) }
+                for (nk in um.keys()) {
+                    UserMeta.parse(um.optJSONObject(nk))?.let { userMetadata["$id::${nk.lowercase()}"] = it }
+                }
+            }
+            if (n.has("metadataLimits")) {
+                val lim = if (n.isNull("metadataLimits")) null else MetadataLimits.parse(n.optJSONObject("metadataLimits"))
+                if (lim == null) metadataLimits.remove(id) else metadataLimits[id] = lim
+            }
             // The snapshot carries each channel's member roster inline.
             n.optJSONArray("channels")?.let { chans ->
                 for (c in 0 until chans.length()) {
@@ -2106,8 +2307,11 @@ open class LurkerClient {
                     // flag-mode string — capture them so the control panel shows the
                     // active modes (and topic) immediately, instead of waiting for
                     // the on-open MODE/TOPIC self-heal to round-trip.
-                    ch.optString("topic").takeIf { it.isNotEmpty() }?.let { topics[key] = it }
-                    ch.optString("modes").takeIf { it.isNotEmpty() }?.let { channelModes[key] = it }
+                    ch.str("topic")?.let { topics[key] = it }
+                    ch.str("modes")?.let { channelModes[key] = it }
+                    val chMeta = UserMeta.parse(ch.optJSONObject("metadata"))
+                    if (chMeta == null) channelMetadata.remove("$id::${chName.lowercase()}")
+                    else channelMetadata["$id::${chName.lowercase()}"] = chMeta
                 }
             }
         }
@@ -2126,7 +2330,7 @@ open class LurkerClient {
                     (0 until md.length()).map { md.optString(it) }
                 } ?: emptyList(),
                 away = m.optBoolean("away", false),
-                host = m.optString("host").ifEmpty { null },
+                host = m.str("host"),
             )
         }
 
@@ -2269,7 +2473,7 @@ open class LurkerClient {
             nick = "",
             text = formatWhois(w),
             self = false,
-            time = frame.optString("time").ifEmpty { null },
+            time = frame.str("time"),
             system = true,
         )
         mergeInto(key, listOf(msg), replace = false)
@@ -2285,16 +2489,16 @@ open class LurkerClient {
         val ident = w.optString("ident")
         val host = w.optString("hostname")
         if (ident.isNotEmpty() || host.isNotEmpty()) append(" ($ident@$host)")
-        w.optString("real_name").takeIf { it.isNotEmpty() }?.let { append("\nname      $it") }
-        w.optString("account").takeIf { it.isNotEmpty() }?.let { append("\naccount   $it") }
-        w.optString("server").takeIf { it.isNotEmpty() }?.let {
+        w.str("real_name")?.let { append("\nname      $it") }
+        w.str("account")?.let { append("\naccount   $it") }
+        w.str("server")?.let {
             append("\nserver    $it")
             w.optString("server_info").takeIf { s -> s.isNotEmpty() }?.let { s -> append(" ($s)") }
         }
-        w.optString("channels").takeIf { it.isNotEmpty() }?.let { append("\nchannels  $it") }
+        w.str("channels")?.let { append("\nchannels  $it") }
         val idle = w.optLong("idle", -1)
         if (idle >= 0) append("\nidle      ${formatIdle(idle)}")
-        w.optString("away").takeIf { it.isNotEmpty() }?.let { append("\naway      $it") }
+        w.str("away")?.let { append("\naway      $it") }
         val actual = listOf(w.optString("actual_hostname"), w.optString("actual_ip"))
             .filter { it.isNotEmpty() }.distinct()
         if (actual.isNotEmpty()) append("\nactually  ${actual.joinToString(" ")}")
@@ -2398,6 +2602,13 @@ open class LurkerClient {
     protected fun countUnread(key: String, frame: JSONObject, msg: Msg) {
         if (key == activeKey || msg.self || msg.system) return
         if (msg.type !in COUNTABLE) return
+        val hit = frame.optBoolean("matched", false) || msg.replyToSelf
+        // As the server counts (Lurker 2.6), so the badge doesn't jump when its
+        // read-state lands: with threads on, a channel's thread reply counts only
+        // as a highlight; a muted buffer counts only its highlights.
+        val inChannel = Commands.isChannel(key.substringAfter("::"))
+        if (!hit && inChannel && msg.replyTo?.root != null && threadsOn) return
+        if (!hit && buffers.firstOrNull { it.key == key }?.let(::isUnreadMuted) == true) return
         unread[key] = (unread[key] ?: 0) + 1
         if (frame.optBoolean("matched", false) || frame.optBoolean("dm", false)) {
             highlights[key] = (highlights[key] ?: 0) + 1
@@ -2622,7 +2833,7 @@ open class LurkerClient {
         val type = e.optString("type")
         val id = e.optLong("id")
         val nick = eventNick(e)
-        val text = e.optString("text")
+        val text = e.str("text").orEmpty()
         // Automated TAGMSG/BATCH "unknown command" bounces: a typing notification
         // (client-only tag carried over TAGMSG) that a network without the
         // message-tags cap rejects with 421. The user never typed it, so drop the
@@ -2638,15 +2849,17 @@ open class LurkerClient {
         return when (type) {
             "message", "action", "notice" -> Msg(
                 id = id, type = type, nick = nick, text = text,
-                self = e.optBoolean("self", false), time = e.optString("time").ifEmpty { null },
+                self = e.optBoolean("self", false), time = e.str("time"),
                 // Persisted flag: the message rode E2E (server already decrypted it).
                 e2e = e.optBoolean("e2e", false),
                 // Highlight rule hit (a mention / your nick) — gold background. A
                 // reply to one of your lines is one too (the server stamps both).
                 matched = e.optBoolean("matched", false) || e.optBoolean("replyToSelf", false),
-                msgid = if (e.isNull("msgid")) null else e.optString("msgid").ifEmpty { null },
+                msgid = if (e.isNull("msgid")) null else e.str("msgid"),
                 replyTo = parseReplyRef(e.optJSONObject("replyTo")),
                 replyToSelf = e.optBoolean("replyToSelf", false),
+                threadReplies = e.optJSONObject("thread")?.optInt("replies", 0) ?: 0,
+                threadLastTime = e.optJSONObject("thread")?.str("lastReplyTime"),
             )
             // The server's own voice: a 401 routed into a channel or DM ("gnat
             // isn't on this network."), a rejected command, an ircd error. It has
@@ -2655,14 +2868,14 @@ open class LurkerClient {
             // and how Scully draws them (a `!!` marker, not the nick column).
             "error" -> Msg(
                 id = id, type = type, nick = nick, text = text,
-                self = false, time = e.optString("time").ifEmpty { null },
+                self = false, time = e.str("time"),
                 system = true,
             )
             // Ephemeral E2E status/handshake line: rendered as a tagged system
             // line (green info / red warn), never persisted. No crypto involved.
             "e2e" -> Msg(
                 id = id, type = "e2e", nick = "", text = text,
-                self = false, time = e.optString("time").ifEmpty { null },
+                self = false, time = e.str("time"),
                 system = true,
                 level = e.optString("level").ifEmpty { "info" },
             )
@@ -2670,7 +2883,7 @@ open class LurkerClient {
             // the peer's DM. Never unread, never a notification.
             "dcc" -> Msg(
                 id = id, type = "dcc", nick = "", text = text,
-                self = false, time = e.optString("time").ifEmpty { null },
+                self = false, time = e.str("time"),
                 system = true,
             )
             // The :system: buffer's log lines (#355): type 'system', nick null,
@@ -2682,13 +2895,13 @@ open class LurkerClient {
                     if (source.isNotEmpty()) append("[").append(source).append("] ")
                     append(text)
                 },
-                self = false, time = e.optString("time").ifEmpty { null },
+                self = false, time = e.str("time"),
                 system = true,
-                level = e.optString("level").ifEmpty { null },
+                level = e.str("level"),
             )
             in SYSTEM_TYPES -> Msg(
                 id = id, type = type, nick = "", text = systemLine(type, nick, text, e),
-                self = e.optBoolean("self", false), time = e.optString("time").ifEmpty { null },
+                self = e.optBoolean("self", false), time = e.str("time"),
                 system = true,
             )
             else -> null // ephemeral (names/typing/state/…) — nothing to render inline
@@ -2949,7 +3162,7 @@ open class LurkerClient {
             // frame is gone — surface a user message now rather than after the
             // ack timeout.
             if (!socket.send(frame.toString())) {
-                frame.optString("clientId").takeIf { it.isNotEmpty() }?.let { failSend(it, "offline") }
+                frame.str("clientId")?.let { failSend(it, "offline") }
             }
         }
     }
@@ -2970,7 +3183,7 @@ open class LurkerClient {
         onDone: (String?, String?) -> Unit,
     ) {
         post { uploading = true }
-        io.execute {
+        uploadIo.execute {
             // Bigger than one chunk, on a server with sessions: send it in pieces
             // that survive a dropped connection (and get past a proxy's request
             // cap). A file that fits in one chunk gains nothing — one request.
@@ -3041,13 +3254,14 @@ open class LurkerClient {
             port = o.optInt("port", 6697),
             tls = o.optBoolean("tls", true),
             nick = o.optString("nick"),
-            username = o.optString("username").ifEmpty { null },
-            realname = o.optString("realname").ifEmpty { null },
+            username = o.str("username"),
+            realname = o.str("realname"),
             autoconnect = o.optBoolean("autoconnect", false),
             hasPassword = o.optBoolean("has_password", false),
             hasSaslPassword = o.optBoolean("has_sasl_password", false),
-            saslAccount = o.optString("sasl_account").ifEmpty { null },
+            saslAccount = o.str("sasl_account"),
             blocked = o.optBoolean("blocked", false),
+            floodProtection = o.optBoolean("flood_protection", true),
         )
     }
 
@@ -3121,13 +3335,19 @@ open class LurkerClient {
     fun loadDcc() = io.execute {
         // Per-feature grants on a newer Lurker. A 404 is an older server: the
         // list's own 403 (below) still decides, as it always did.
-        val cfg = runCatching {
+        // Only a 404 means "older server": a 502 or a timeout mid-reconnect keeps
+        // the grants we had, or every send entry would vanish until the DCC
+        // screen was reopened.
+        var olderServer = false
+        val fresh = runCatching {
             rest.newCall(authed("/api/dcc/config").build()).execute().use { res ->
+                if (res.code == 404) olderServer = true
                 if (!res.isSuccessful) null
                 else runCatching { DccConfig.parse(JSONObject(res.body?.string().orEmpty())) }.getOrNull()
             }
         }.getOrNull()
-        post { dccConfig = cfg }
+        if (fresh != null || olderServer) post { dccConfig = fresh }
+        val cfg = fresh ?: if (olderServer) null else dccConfig
         if (cfg != null && (cfg.receive || cfg.send)) loadDccFilesNow()
         try {
             rest.newCall(authed("/api/dcc?limit=100").build()).execute().use { res ->
@@ -3166,7 +3386,7 @@ open class LurkerClient {
                 if (!res.isSuccessful) {
                     val why = runCatching { JSONObject(res.body?.string().orEmpty()).optString("error") }.getOrNull()
                     val msg = why?.ifEmpty { null } ?: "DCC $action failed (HTTP ${res.code})"
-                    post { dccError = msg; report?.let { localNotice(it, msg) } }
+                    post { if (report != null) localNotice(report, msg) else dccError = msg }
                     return@execute
                 }
                 JSONObject(res.body?.string().orEmpty()).optJSONObject("transfer")?.let {
@@ -3174,7 +3394,8 @@ open class LurkerClient {
                 }
             }
         } catch (e: Exception) {
-            post { dccError = "DCC $action failed: ${e.message}" }
+            val msg = "DCC $action failed: ${e.message}"
+            post { if (report != null) localNotice(report, msg) else dccError = msg }
         }
     }
 
@@ -3193,7 +3414,9 @@ open class LurkerClient {
     /** A DCC REST call whose JSON answer is handed to [ok]; any refusal lands in
      *  [dccError] with the server's own reason. */
     private fun dccCall(what: String, req: Request, report: Buffer? = null, ok: (JSONObject, Int) -> Unit) = io.execute {
-        fun fail(msg: String) = post { dccError = msg; report?.let { localNotice(it, msg) } }
+        // Said once: in the chat it came from, else on the DCC screen (and as a
+        // toast anywhere else) — never both.
+        fun fail(msg: String) = post { if (report != null) localNotice(report, msg) else dccError = msg }
         try {
             rest.newCall(req).execute().use { res ->
                 val text = res.body?.string().orEmpty()
@@ -3212,8 +3435,7 @@ open class LurkerClient {
     /** A 409's reason, said where the user asked (and on the DCC screen). */
     private fun dccRefused(b: JSONObject, fallback: String, report: Buffer?) {
         val msg = b.optString("error").ifEmpty { fallback }
-        dccError = msg
-        report?.let { localNotice(it, msg) }
+        if (report != null) localNotice(report, msg) else dccError = msg
     }
 
     /** Clear a finished transfer from the list (its kept file stays). One still
@@ -3411,7 +3633,11 @@ open class LurkerClient {
         }
         // Complete. Its answer can outlast the request, so a lost or 409
         // "processing" answer is read back from the session once it's done.
-        repeat(60) {
+        // Handing a big file on can take minutes (the protocol says keep polling),
+        // so the wait scales with the size: 5 min, plus a minute per 64 MB, ≤1 h.
+        val deadline = System.currentTimeMillis() +
+            (5 * 60_000L + (src.size / (64L * 1024 * 1024)) * 60_000L).coerceAtMost(60 * 60_000L)
+        while (System.currentTimeMillis() < deadline) {
             try {
                 uploadHttp.newCall(authed("/api/upload-sessions/$id/complete").post("{}".toRequestBody(json)).build())
                     .execute().use { res ->
@@ -3454,21 +3680,26 @@ open class LurkerClient {
         passive: Boolean = false,
         /** An SSEND, over TLS (Lurker 2.5; the fork's own route has none). */
         secure: Boolean = false,
-    ) = io.execute {
+        /** Where a failure is said, besides the DCC screen: the chat it came from. */
+        report: Buffer? = null,
+    ) = uploadIo.execute {
+        // Said once: in the chat it came from, else on the DCC screen (and as a
+        // toast anywhere else) — never both.
+        fun fail(msg: String) = post { if (report != null) localNotice(report, msg) else dccError = msg }
         // Upstream Lurker (after 2.4.3): upload into a dcc-send session, which
         // keeps the file as one of the account's, then offer that file.
         if (dccConfig?.send == true) {
             if (source == null || source.size <= 0) {
-                post { dccError = "Couldn't read that file's size, so it can't be sent." }
+                fail("Couldn't read that file's size, so it can't be sent.")
                 return@execute
             }
             try {
                 val file = uploadViaSession("dcc-send", filename, source).optJSONObject("file")
                     ?.let(DccFile::parse) ?: throw UploadFailed("The server didn't keep the file.")
                 post { dccFiles[file.id] = file }
-                dccSendKeptFile(networkId, nick, file.id, passive = passive, secure = secure)
+                dccSendKeptFile(networkId, nick, file.id, passive = passive, secure = secure, report = report)
             } catch (e: Exception) {
-                post { dccError = "DCC send failed: ${e.message}" }
+                fail("DCC send failed: ${e.message}")
             }
             return@execute
         }
@@ -3483,7 +3714,7 @@ open class LurkerClient {
                 val bodyText = res.body?.string().orEmpty()
                 if (!res.isSuccessful) {
                     val err = runCatching { JSONObject(bodyText).optString("error") }.getOrNull()
-                    post { dccError = err?.ifEmpty { null } ?: "DCC send failed (HTTP ${res.code})" }
+                    fail(err?.ifEmpty { null } ?: "DCC send failed (HTTP ${res.code})")
                     return@execute
                 }
                 JSONObject(bodyText).optJSONObject("transfer")?.let {
@@ -3491,7 +3722,7 @@ open class LurkerClient {
                 }
             }
         } catch (e: Exception) {
-            post { dccError = "DCC send failed: ${e.message}" }
+            fail("DCC send failed: ${e.message}")
         }
     }
 
@@ -3726,7 +3957,7 @@ open class LurkerClient {
         if (o == null) return null
         val msgid = o.optString("msgid")
         if (msgid.isEmpty()) return null
-        return ReplyRef(msgid, parseReplyParent(o.optJSONObject("parent")))
+        return ReplyRef(msgid, parseReplyParent(o.optJSONObject("parent")), o.str("root"))
     }
 
     private fun parseDraftReply(o: JSONObject?): DraftReply? {
@@ -3789,7 +4020,7 @@ open class LurkerClient {
             nick = o.optString("nick", "*"),
             // Search rows use DB columns (body/createdAt); fall back to live-frame names.
             body = o.optString("body").ifEmpty { o.optString("text") },
-            createdAt = o.optString("createdAt").ifEmpty { o.optString("time").ifEmpty { null } },
+            createdAt = o.str("createdAt") ?: o.str("time"),
             replyTo = parseReplyRef(o.optJSONObject("replyTo"))?.parent,
         )
     }
@@ -3879,7 +4110,7 @@ open class LurkerClient {
                                 target = o.optString("target"),
                                 nick = if (o.isNull("nick")) "*" else o.optString("nick", "*"),
                                 body = o.optString("text"),
-                                createdAt = o.optString("time").ifEmpty { null },
+                                createdAt = o.str("time"),
                                 reaction = value,
                             ),
                         )
@@ -3975,6 +4206,174 @@ open class LurkerClient {
         ws?.send(JSONObject().put("type", "set-nick-note").put("networkId", networkId).put("nick", nick).put("note", note).toString())
     }
 
+    // ---- Reply threads (Lurker 2.6, #1225) ----------------------------------
+
+    /** The user's `chat.threads` setting: replies leave the channel for the thread sheet. */
+    val threadsOn: Boolean get() = serverFeatures && settingBool("chat.threads", false)
+
+    private fun noteBufferId(key: String, frame: JSONObject) {
+        if (frame.isNull("bufferId")) return
+        frame.optInt("bufferId", 0).takeIf { it > 0 }?.let { bufferIds[key] = it }
+    }
+
+    /** A live reply to [root]: its line's count goes up, and an open thread gets it. */
+    private fun bumpThread(bufferKey: String, root: String, reply: Msg) {
+        messagesByBuffer[bufferKey]?.let { list ->
+            val i = list.indexOfLast { it.msgid == root }
+            if (i >= 0) {
+                val r = list[i]
+                messagesByBuffer[bufferKey] = list.toMutableList().also {
+                    it[i] = r.copy(threadReplies = r.threadReplies + 1, threadLastTime = reply.time ?: r.threadLastTime)
+                }
+            }
+        }
+        val tv = threadView
+        if (tv != null && tv.bufferKey == bufferKey && tv.rootMsgid == root && tv.replies.none { it.id == reply.id && reply.id > 0 }) {
+            threadView = tv.copy(replies = tv.replies + reply)
+            markThreadRead()
+        }
+    }
+
+    /** The followed thread under [rootMsgid] in [buffer], if the user follows it. */
+    fun followedThread(buffer: Buffer, rootMsgid: String): FollowedThread? {
+        val bid = bufferIds[buffer.key]
+        return followedThreads.firstOrNull {
+            it.rootMsgid == rootMsgid &&
+                (if (bid != null) it.bufferId == bid else it.networkId == buffer.networkId && it.target.equals(buffer.target, true))
+        }
+    }
+
+    /** Open the thread under [rootMsgid]: what we hold shows at once, the server's whole copy follows. */
+    fun openThread(buffer: Buffer, rootMsgid: String) {
+        val held = messagesByBuffer[buffer.key].orEmpty()
+        val token = ++threadToken
+        val bid = bufferIds[buffer.key]
+        threadView = ThreadView(
+            bufferKey = buffer.key,
+            rootMsgid = rootMsgid,
+            token = token,
+            root = held.lastOrNull { it.msgid == rootMsgid },
+            replies = held.filter { it.replyTo?.root == rootMsgid },
+            loading = bid != null && ws != null,
+        )
+        if (bid != null) {
+            ws?.send(JSONObject().put("type", "thread").put("bufferId", bid).put("rootMsgid", rootMsgid).put("token", token).toString())
+        }
+    }
+
+    fun closeThread() {
+        threadView = null
+    }
+
+    /** Ask for [buffer]'s threads (newest 50), for the "Threads" list. */
+    fun loadThreads(buffer: Buffer) {
+        threadList = null
+        val bid = bufferIds[buffer.key] ?: run { threadList = emptyList(); return }
+        val token = ++threadListToken
+        ws?.send(JSONObject().put("type", "threads").put("bufferId", bid).put("token", token).toString())
+    }
+
+    /** The open thread has been seen through its last reply — only a followed one with unread keeps a pointer. */
+    private fun markThreadRead() {
+        val tv = threadView ?: return
+        val bid = bufferIds[tv.bufferKey] ?: return
+        val followed = followedThreads.firstOrNull { it.bufferId == bid && it.rootMsgid == tv.rootMsgid } ?: return
+        if (followed.unread <= 0) return
+        val last = tv.replies.lastOrNull { it.id > 0 }?.id ?: return
+        ws?.send(
+            JSONObject().put("type", "thread-read").put("bufferId", bid)
+                .put("rootMsgid", tv.rootMsgid).put("messageId", last).toString(),
+        )
+    }
+
+    /**
+     * Reply in the open thread, as the web's thread composer does: answer the newest
+     * reply from someone else (else the root, else the oldest usable reply), and
+     * address its author unless it's your own line or this is a DM. Returns why it
+     * can't go, or null once it's away.
+     */
+    fun sendThreadReply(buffer: Buffer, text: String): String? {
+        val tv = threadView ?: return "No thread is open."
+        val body = text.trim()
+        if (body.isEmpty()) return null
+        if (body.startsWith("/") && !body.startsWith("//")) return "Commands don't run in a thread."
+        if (body.contains('\n') || body.toByteArray().size > 400) return "Too long for one line."
+        fun usable(m: Msg) = m.id > 0 && m.msgid != null && !m.e2e && !m.system
+        val target = tv.replies.lastOrNull { usable(it) && !it.self }
+            ?: tv.root?.takeIf(::usable)
+            ?: tv.replies.firstOrNull(::usable)
+            ?: return "There's no line here a reply can name."
+        val addressed = if (target.self || !buffer.isChannel) body else "${target.nick}: $body"
+        execute(buffer, listOf(WireOp("send", text = addressed, replyTo = target.id)))
+        return null
+    }
+
+    fun userMeta(networkId: Int?, nick: String): UserMeta? =
+        networkId?.let { userMetadata["$it::${nick.lowercase()}"] }
+
+    /**
+     * The name to show for [nick] where the web shows display names (message
+     * heads, the member list): its IRCv3 display name, formatting stripped, when
+     * the user's `look.nick.display_names` setting is on (the default). Colour,
+     * mentions and every action stay keyed on the nick.
+     */
+    fun displayNameFor(networkId: Int?, nick: String): String? {
+        if (!settingBool("look.nick.display_names", true)) return null
+        return userMeta(networkId, nick)?.shownName?.takeIf { !it.equals(nick, ignoreCase = false) }
+    }
+
+    /** Let a caller our +g turned away through: `ACCEPT nick` (their next message gets in). */
+    fun acceptCaller(block: CallerIdBlock) {
+        callerIdBlocked.remove(block)
+        ws?.send(JSONObject().put("type", "raw").put("networkId", block.networkId).put("line", "ACCEPT ${block.nick}").toString())
+    }
+
+    fun dismissCaller(block: CallerIdBlock) {
+        callerIdBlocked.remove(block)
+    }
+
+    fun relayBot(networkId: Int?, nick: String): RelayBot? =
+        networkId?.let { relayBots["$it::${nick.lowercase()}"] }
+
+    fun isRelayBot(networkId: Int?, nick: String): Boolean = relayBot(networkId, nick) != null
+
+    /** One network's marks, by nick — what the relay screen and /relay list show. */
+    fun relayBotsFor(networkId: Int): List<RelayBot> =
+        relayBots.values.filter { it.networkId == networkId }.sortedBy { it.nick.lowercase() }
+
+    /**
+     * Mark or unmark [nick] as a relay bot on a network, with an optional custom
+     * [pattern] ("" for the built-in formats). The server answers every tab with
+     * `relay-bot-updated`, which is what lands the mark here.
+     */
+    open fun setRelayBot(networkId: Int, nick: String, marked: Boolean, pattern: String = "") {
+        val n = nick.trim()
+        if (n.isEmpty()) return
+        ws?.send(
+            JSONObject()
+                .put("type", "set-relay-bot")
+                .put("networkId", networkId)
+                .put("nick", n)
+                .put("marked", marked)
+                .put("pattern", pattern.take(Relay.MAX_PATTERN))
+                .toString(),
+        )
+    }
+
+    /**
+     * [msg] as the timeline shows it: from a marked relay bot, a copy attributed
+     * to the speaker inside its envelope (bridges of bridges unwrapped too), else
+     * [msg] itself. Only plain lines from someone else — relays bridge speech as
+     * PRIVMSG, and a notice or /me renders its own way.
+     */
+    fun relayDisplay(networkId: Int?, msg: Msg): Msg {
+        if (networkId == null || msg.type != "message" || msg.self || msg.system || msg.nick.isEmpty()) return msg
+        val outer = relayBot(networkId, msg.nick) ?: return msg
+        val parsed = Relay.parseChain(msg.text, outer.pattern) { inner -> relayBot(networkId, inner)?.pattern }
+            ?: return msg
+        return msg.copy(nick = parsed.nick, text = parsed.text, relayBot = msg.nick, relaySource = parsed.source)
+    }
+
     fun isNotifyAlways(buffer: Buffer): Boolean =
         buffer.networkId?.let { notifyAlways["$it::${buffer.target}"] } == true
 
@@ -3992,13 +4391,15 @@ open class LurkerClient {
     // still buzz on a muted channel (freakyy85's relayed-channel report). We
     // apply the mute locally: honor it in the notify path AND expose a toggle.
 
-    /** The channel-scope NONOTIFY/ALL mute rule for [buffer], if one exists. */
+    /** The whole-buffer NONOTIFY/NOUNREAD/ALL rule for [buffer] (channel or DM —
+     *  Lurker 2.6 mutes a DM the same way), if one exists. */
     private fun channelMuteRule(buffer: Buffer): IgnoreRule? {
         val nid = buffer.networkId ?: return null
         return ignores.firstOrNull { r ->
             !r.isExcept &&
                 r.mask == null &&
-                (r.levels.contains("NONOTIFY") || r.levels.contains("ALL")) &&
+                r.pattern.isNullOrEmpty() &&
+                (r.levels.contains("NONOTIFY") || r.levels.contains("NOUNREAD") || r.levels.contains("ALL")) &&
                 (r.networkId == null || r.networkId == nid) &&
                 r.channels?.any { it.equals(buffer.target, true) } == true
         }
@@ -4006,14 +4407,53 @@ open class LurkerClient {
 
     fun isNotifyMuted(buffer: Buffer): Boolean = channelMuteRule(buffer) != null
 
-    /** Toggle "mute notifications" for a channel. On = add a channel-scoped
-     *  NONOTIFY rule (keeps messages visible, just silences pings); off = remove it. */
-    fun setNotifyMuted(buffer: Buffer, on: Boolean) {
+    /**
+     * The Muted rung (Lurker 2.6): a whole-buffer NOUNREAD rule on this buffer or
+     * its network. The server then counts only real highlight matches — a DM's
+     * `highlights` stops equalling its `unread` — so the badge shows highlights only.
+     */
+    fun isUnreadMuted(buffer: Buffer): Boolean {
+        val nid = buffer.networkId ?: return false
+        return ignores.any { r ->
+            !r.isExcept && r.mask == null && r.pattern.isNullOrEmpty() && "NOUNREAD" in r.levels &&
+                (r.networkId == null || r.networkId == nid) &&
+                (r.channels == null && r.networkId == nid || r.channels?.any { it.equals(buffer.target, true) } == true)
+        }
+    }
+
+    /**
+     * Where [buffer] sits on the web's notification ladder: `all`, `highlights`
+     * (a channel's default), `nothing` (NONOTIFY) or `muted` (NOUNREAD+NONOTIFY).
+     * A DM has no highlights rung — every DM line is for you — so `all` is its default.
+     */
+    fun notifyLevel(buffer: Buffer): String {
+        val rule = channelMuteRule(buffer)
+        return when {
+            rule != null && "NOUNREAD" in rule.levels -> "muted"
+            rule != null -> "nothing"
+            buffer.isChannel && isNotifyAlways(buffer) -> "all"
+            buffer.isChannel -> "highlights"
+            else -> "all"
+        }
+    }
+
+    /** Move [buffer] to a rung: the old whole-buffer rule goes first, as the web does. */
+    fun setNotifyLevel(buffer: Buffer, level: String) {
         val networkId = buffer.networkId ?: return
+        if (level == notifyLevel(buffer)) return
+        channelMuteRule(buffer)?.let { removeIgnore(it.networkId, it.id) }
+        if (buffer.isChannel && isNotifyAlways(buffer) != (level == "all")) setNotifyAlways(buffer, level == "all")
+        val target = buffer.target.lowercase()
+        when (level) {
+            "nothing" -> addIgnore(networkId, mask = null, levels = listOf("NONOTIFY"), channels = listOf(target))
+            "muted" -> addIgnore(networkId, mask = null, levels = listOf("NOUNREAD", "NONOTIFY"), channels = listOf(target))
+        }
+    }
+
+    /** Toggle "mute notifications": on = the Nothing rung (lines stay, pings stop). */
+    fun setNotifyMuted(buffer: Buffer, on: Boolean) {
         if (on) {
-            if (channelMuteRule(buffer) == null) {
-                addIgnore(networkId, mask = null, levels = listOf("NONOTIFY"), channels = listOf(buffer.target))
-            }
+            if (channelMuteRule(buffer) == null) setNotifyLevel(buffer, "nothing")
         } else {
             channelMuteRule(buffer)?.let { removeIgnore(it.networkId, it.id) }
         }
@@ -4138,9 +4578,9 @@ open class LurkerClient {
                 IgnoreRule(
                     id = o.optLong("id"),
                     networkId = networkId,
-                    mask = if (o.isNull("mask")) null else o.optString("mask").takeIf { it.isNotEmpty() },
+                    mask = if (o.isNull("mask")) null else o.str("mask"),
                     channels = channels,
-                    pattern = if (o.isNull("pattern")) null else o.optString("pattern").takeIf { it.isNotEmpty() },
+                    pattern = if (o.isNull("pattern")) null else o.str("pattern"),
                     patternKind = o.optString("patternKind").ifEmpty { "substr" },
                     levels = levels,
                     isExcept = o.optBoolean("isExcept", false),
@@ -4187,14 +4627,15 @@ open class LurkerClient {
             received = o.optLong("received_bytes", 0),
             total = o.optLong("advertised_size", 0),
             direction = o.optString("direction", "recv"),
-            error = o.optString("error").ifEmpty { null },
+            // Android's optString turns a JSON null into "null" — every row has one.
+            error = if (o.isNull("error")) null else o.str("error"),
             hasFile = !o.isNull("destination_path") && o.optString("destination_path").isNotEmpty() &&
                 (o.isNull("file_deleted_at") || o.optString("file_deleted_at").isEmpty()),
             fileId = if (o.isNull("file_id")) null else o.optInt("file_id", -1).takeIf { it > 0 },
             networkId = intOrNull("network_id")?.takeIf { it > 0 },
             passive = flag("passive"),
             secure = flag("secure"),
-            crcStatus = if (o.isNull("crc_status")) null else o.optString("crc_status").ifEmpty { null },
+            crcStatus = if (o.isNull("crc_status")) null else o.str("crc_status"),
             pack = intOrNull("pack"),
             queueSeq = intOrNull("queue_seq"),
             attempt = o.optInt("attempt", 1),
@@ -4326,7 +4767,7 @@ open class LurkerClient {
             choices = choices,
             min = if (o.has("min")) o.optInt("min") else null,
             max = if (o.has("max")) o.optInt("max") else null,
-            requiresFeature = o.optString("requiresFeature").ifEmpty { null },
+            requiresFeature = o.str("requiresFeature"),
         )
     }
 
